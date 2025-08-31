@@ -1,0 +1,198 @@
+🔹 Step 1: Save the script
+
+On each OKE worker node:
+
+sudo vi /usr/local/bin/prune_unused_images.sh
+
+
+Paste your script:
+
+#!/bin/bash
+# Script: prune_unused_images.sh
+# Purpose: Remove unused container images from OKE worker nodes using crictl
+
+set -euo pipefail
+
+LOGFILE="/var/log/oke-crictl-prune.log"
+
+echo "========================================" | tee -a "$LOGFILE"
+echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting unused image prune on $(hostname)" | tee -a "$LOGFILE"
+
+if ! command -v crictl &>/dev/null; then
+    echo "ERROR: crictl not found. Please install crictl first." | tee -a "$LOGFILE"
+    exit 1
+fi
+
+echo ">>> Current image usage before prune:" | tee -a "$LOGFILE"
+crictl images | tee -a "$LOGFILE"
+
+echo ">>> Running crictl image prune..." | tee -a "$LOGFILE"
+crictl image prune -f | tee -a "$LOGFILE"
+
+echo ">>> Current image usage after prune:" | tee -a "$LOGFILE"
+crictl images | tee -a "$LOGFILE"
+
+echo "$(date '+%Y-%m-%d %H:%M:%S') - Completed image prune." | tee -a "$LOGFILE"
+echo "========================================" | tee -a "$LOGFILE"
+
+
+Make it executable:
+
+sudo chmod +x /usr/local/bin/prune_unused_images.sh
+
+🔹 Step 2: Add a cron job
+
+Edit root’s crontab:
+
+sudo crontab -e
+
+
+Add an entry (example: run every Sunday at midnight):
+
+0 0 * * 0 /usr/local/bin/prune_unused_images.sh
+
+
+👉 Some useful schedules:
+
+Daily at 2 AM:
+
+0 2 * * * /usr/local/bin/prune_unused_images.sh
+
+
+Weekly (Sunday midnight):
+
+0 0 * * 0 /usr/local/bin/prune_unused_images.sh
+
+🔹 Step 3: Verify
+
+Check cron jobs:
+
+sudo crontab -l
+
+
+Check logs after it runs:
+
+cat /var/log/oke-crictl-prune.log
+
+
+⚠️ Notes:
+
+You’ll need to repeat this setup on each OKE worker node (unless you automate via cloud-init, Ansible, or a DaemonSet).
+
+crictl should already be installed on OKE worker nodes (since OKE uses containerd under the hood).
+
+==========================================================================================
+
+There are 2 common ways to roll out a cronjob script to all worker nodes in OKE:
+
+🔹 Option 1: Cloud-Init / Instance Metadata (best for new nodes)
+
+If your worker nodes are created via Node Pool in OKE, you can inject the script + cronjob at provisioning time using cloud-init (user data).
+
+Example cloud-init YAML you can attach when creating/updating the node pool:
+
+#cloud-config
+write_files:
+  - path: /usr/local/bin/prune_unused_images.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      LOGFILE="/var/log/oke-crictl-prune.log"
+      echo "========================================" | tee -a "$LOGFILE"
+      echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting unused image prune on $(hostname)" | tee -a "$LOGFILE"
+      if ! command -v crictl &>/dev/null; then
+          echo "ERROR: crictl not found." | tee -a "$LOGFILE"
+          exit 1
+      fi
+      crictl images | tee -a "$LOGFILE"
+      crictl image prune -f | tee -a "$LOGFILE"
+      crictl images | tee -a "$LOGFILE"
+      echo "$(date '+%Y-%m-%d %H:%M:%S') - Completed image prune." | tee -a "$LOGFILE"
+      echo "========================================" | tee -a "$LOGFILE"
+
+runcmd:
+  - echo "0 2 * * * root /usr/local/bin/prune_unused_images.sh" > /etc/cron.d/prune-crictl
+
+
+➡️ With this, every new worker node automatically gets the script + cronjob.
+
+🔹 Option 2: Kubernetes DaemonSet (best for existing nodes)
+
+If you already have running worker nodes, you can use a DaemonSet that mounts the host filesystem and installs the cronjob into /etc/cron.d.
+
+Here’s a DaemonSet YAML:
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cronjob-prune-crictl
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: prune-crictl
+  template:
+    metadata:
+      labels:
+        app: prune-crictl
+    spec:
+      hostPID: true
+      hostNetwork: true
+      tolerations:
+      - operator: "Exists"
+      containers:
+      - name: setup-cronjob
+        image: alpine:3.19
+        securityContext:
+          privileged: true
+        command:
+          - /bin/sh
+          - -c
+          - |
+            echo "Installing cronjob on node $(hostname)..."
+            cat <<'EOF' > /host/usr/local/bin/prune_unused_images.sh
+            #!/bin/bash
+            set -euo pipefail
+            LOGFILE="/var/log/oke-crictl-prune.log"
+            echo "========================================" | tee -a "$LOGFILE"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting unused image prune on $(hostname)" | tee -a "$LOGFILE"
+            if ! command -v crictl &>/dev/null; then
+                echo "ERROR: crictl not found." | tee -a "$LOGFILE"
+                exit 1
+            fi
+            crictl images | tee -a "$LOGFILE"
+            crictl image prune -f | tee -a "$LOGFILE"
+            crictl images | tee -a "$LOGFILE"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Completed image prune." | tee -a "$LOGFILE"
+            echo "========================================" | tee -a "$LOGFILE"
+            EOF
+
+            chmod +x /host/usr/local/bin/prune_unused_images.sh
+
+            echo "0 2 * * * root /usr/local/bin/prune_unused_images.sh" > /host/etc/cron.d/prune-crictl
+            echo "Cronjob installed."
+            sleep 3600
+        volumeMounts:
+          - name: host
+            mountPath: /host
+      volumes:
+        - name: host
+          hostPath:
+            path: /
+
+
+➡️ This runs a pod on every node (DaemonSet), mounts the host root (/), drops the script in /usr/local/bin/, and adds the cronjob in /etc/cron.d/.
+
+After rollout, each node has the cronjob locally, and the pod can be deleted (cron will persist).
+
+🔹 Option 3: Config Management (OCI OSMS, Ansible, etc.)
+
+If you already use OCI OS Management Service (OSMS), Ansible, or other config tools, you can push this script + cronjob that way.
+
+✅ Recommendation:
+
+For new nodes → Cloud-init (persistent).
+
+For existing nodes → DaemonSet bootstrap.
