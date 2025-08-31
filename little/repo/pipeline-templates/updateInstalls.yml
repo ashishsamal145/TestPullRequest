@@ -1,0 +1,142 @@
+# updateInstalls.yaml
+
+steps:
+    - task: Bash@3
+      displayName: install zip
+      inputs:
+        targetType: 'inline'
+        script: |
+          which zip
+          if [ ! -f /usr/bin/zip ]
+          then
+             sudo apt-get -y install zip
+          fi
+    - task: HelmInstaller@0
+      displayName: Install Kubernetes/Helm
+      inputs:
+        helmVersion: '2.14.1'
+        installKubectl: true
+    - task: Bash@3
+      displayName: Install kubelogin
+      inputs:
+        targetType: 'inline'
+        script: |
+          # get kubelogin
+          if [ ! -f /usr/bin/kubelogin ]
+          then
+            wget https://github.com/Azure/kubelogin/releases/download/v0.0.9/kubelogin-linux-amd64.zip
+            unzip kubelogin-linux-amd64.zip
+            sudo mv bin/linux_amd64/kubelogin /usr/bin
+          fi 
+    - task: AzureCLI@2
+      name: "Install_azure_modules"
+      inputs:
+        azureSubscription: 'cfo-apps-revpred-deploy-dev-AKSLOWDEVPRV001'    # dont really care what subscription, any valid will do
+        scriptType: 'pscore'
+        scriptLocation: 'inlineScript'
+        failOnStandardError: false
+        powerShellErrorActionPreference: 'continue'
+        inlineScript: |
+
+          if (-not (Get-Module -list 'az.accounts')) {
+            Install-Module az.accounts -Scope CurrentUser -Force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'az.resources'))  {
+            Install-Module az.resources -scope currentuser -force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'az.storage'))  {
+            Install-Module az.storage -scope currentuser -force -SkipPublisherCheck 
+            }
+
+
+Explanataion:-----------------------------------------------------------------------------------------------------------------------------------
+
+Step 1: Ensure zip is installed
+- task: Bash@3
+  displayName: install zip
+  script: |
+    which zip
+    if [ ! -f /usr/bin/zip ]
+    then
+       sudo apt-get -y install zip
+    fi
+
+
+Checks if zip is already installed (/usr/bin/zip).
+
+If not, installs it using apt-get.
+
+Needed because later stages unzip packages (like kubelogin) and sometimes publish zipped artifacts.
+
+🔹 Step 2: Install Helm (and kubectl)
+- task: HelmInstaller@0
+  displayName: Install Kubernetes/Helm
+  inputs:
+    helmVersion: '2.14.1'
+    installKubectl: true
+
+
+Installs Helm v2.14.1 (a package manager for Kubernetes).
+
+Also installs kubectl (the CLI to interact with Kubernetes clusters).
+
+Both are required to interact with AKS and deploy manifests.
+
+🔹 Step 3: Install kubelogin
+- task: Bash@3
+  displayName: Install kubelogin
+  script: |
+    if [ ! -f /usr/bin/kubelogin ]
+    then
+      wget https://github.com/Azure/kubelogin/releases/download/v0.0.9/kubelogin-linux-amd64.zip
+      unzip kubelogin-linux-amd64.zip
+      sudo mv bin/linux_amd64/kubelogin /usr/bin
+    fi 
+
+
+Ensures kubelogin is available.
+
+kubelogin integrates Azure AD authentication into kubectl (critical for accessing AKS clusters with Azure-managed identity/service principal).
+
+If not present, downloads release v0.0.9, unzips, and installs into /usr/bin.
+
+🔹 Step 4: Install required Azure PowerShell modules
+- task: AzureCLI@2
+  name: "Install_azure_modules"
+  inputs:
+    azureSubscription: 'cfo-apps-revpred-deploy-dev-AKSLOWDEVPRV001'
+    scriptType: 'pscore'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      if (-not (Get-Module -list 'az.accounts')) {
+        Install-Module az.accounts -Scope CurrentUser -Force -SkipPublisherCheck 
+      }
+      if (-not (Get-Module -list 'az.resources'))  {
+        Install-Module az.resources -scope currentuser -force -SkipPublisherCheck 
+      }
+      if (-not (Get-Module -list 'az.storage'))  {
+        Install-Module az.storage -scope currentuser -force -SkipPublisherCheck 
+      }
+
+
+Runs inside an AzureCLI@2 task, authenticated with a valid Azure subscription (any subscription works, since the task is just to install modules).
+
+Installs required Azure PowerShell modules (az.accounts, az.resources, az.storage).
+
+These are used in later steps of deployTrainJobManifest.yml (for storage account, container creation, secrets, etc.).
+
+✅ Why this template exists
+
+Keeps the main pipeline clean by separating setup/bootstrapping into a shared file.
+
+Guarantees all later steps (kubectl, helm, kubelogin, Azure storage commands) won’t fail due to missing tools.
+
+Makes the pipeline reusable across Dev/Prod — because no matter the agent, this template ensures the right environment is in place.
+
+👉 So in the bigger picture:
+
+SetTimestamp = generates a unique ID for the training run.
+
+updateInstalls.yml = prepares the environment.
+
+deployTrainJobManifest.yml = actually deploys and monitors the training job on AKS.

@@ -1,0 +1,666 @@
+# deployScorejobmaifests.yaml
+
+# job variables from pipeline
+#        $(jobName)
+#        $(jobManifest)
+#        input build pipelines
+
+parameters:
+  DEPLOYMENT_SERVICE_CONNECTION: 'NOT_DEFINE'
+  NAMESPACE: 'NOT_DEFINE'
+  AZURE_STORAGE_ACCOUNT: 'NOT_DEFINE'
+  AZURE_STORAGE_ACCOUNT_SAS_TOKEN: 'NOT_DEFINE'
+  ARTIFACT_NAME: 'NOT_DEFINE'
+  AZURE_MODEL2_OUTPUT_CONTAINER: 'NOT_DEFINE'
+  AZURE_STORAGE_WORKSPACE_CONTAINER: 'NOT_DEFINE'
+
+steps:  
+          - template: updateInstalls.yml  # Template reference
+
+          - task: AzureCLI@2
+            displayName: Get storage account name
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}' 
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              addSpnToEnvironment: true
+              inlineScript: |
+
+                 gci -recurse * | select directory, name
+
+                 gci env: |  where Name -notmatch token | format-table -wrap
+                 
+                 $storageAccounts=(az resource list -o json | convertfrom-json) | where type -eq "Microsoft.Storage/storageAccounts"
+                 $storageAccounts | format-table
+                 $AzureStorageAccount='${{parameters.AZURE_STORAGE_ACCOUNT}}'
+                 # if a specific storage account was not specified, take the storage account from the service connection
+                 if ($AzureStorageAccount -eq 'NOT_DEFINE') {
+                    $AzureStorageAccount = ($storageAccounts | select -First 1).name                   
+                    }
+                 Write-Host "##vso[task.setvariable variable=AzureStorageAccount;]$AzureStorageAccount"
+                 Write-host "using storage account $AzureStorageAccount"
+            
+          - task: PowerShell@2
+            displayName: 'Check Environment variables'
+            inputs:
+                targetType: 'inline'
+                script: |
+                  # Write your PowerShell commands here.
+                      
+                  gci env: | format-table -wrap
+                  gci  -recurse | select fullname
+          
+          - task: AzureCLI@2
+            displayName: Get aks cluster name
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              addSpnToEnvironment: true
+              inlineScript: |
+                # we arent using az aks list anymore as it's not working consistently in all environments
+                $resources = az resource list -o json | convertfrom-json       
+                $aksList = $resources | where 'type' -eq 'Microsoft.ContainerService/managedClusters'
+                $aksList | format-table
+                $aksName='$(aksName)'
+                $aksResourceGroup='$(aksResourceGroup)'
+                # use specific aks is named, otherwise derive from service connection permissions
+                if (('set in script' -eq $aksResourceGroup) -or ('set in script' -eq $aksName))
+                {
+                  write-host "Setting aks from service connection environment"
+                  $aksName = ($aksList | select -First 1).name
+                  $aksResourceGroup= ($aksList | select -First 1).resourceGroup
+                }
+                Write-host "using aks $aksName resource group $aksResourceGroup "
+                Write-Host "##vso[task.setvariable variable=aksName;]$aksName"
+                Write-Host "##vso[task.setvariable variable=aksResourceGroup;]$aksResourceGroup"  
+          
+          - task: AzureCLI@2
+            displayName: use kubelogin to connect
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+
+                Write-host "using aks $(aksName) resource group $(aksResourceGroup)"
+                rm -f ".kube/config" &&  az aks get-credentials --resource-group '$(aksResourceGroup)' \
+                      --name '$(aksName)' \
+                      --overwrite-existing 
+
+                kubelogin convert-kubeconfig -l azurecli
+
+                kubectl config set-context --current --namespace '${{parameters.NAMESPACE}}'
+
+                kubectl get pods 2>&1
+
+          - task: AzureCLI@2
+            displayName: apply manifest
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+              scriptType: 'pscore'
+              powerShellErrorActionPreference: continue
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                
+                kubectl delete secret         $(jobName)-secret  2>&1 | Out-Null
+                kubectl create secret generic $(jobName)-secret --from-literal=AZURE_SAS_TOKEN='${{parameters.AZURE_STORAGE_ACCOUNT_SAS_TOKEN}}'
+
+                kubectl delete configmap      $(jobName)-config  2>&1 | Out-Null
+                kubectl create configmap      $(jobName)-config --from-literal=AZURE_STORAGE_ACCOUNT=$(AzureStorageAccount) `
+                                                                --from-literal=WORKSPACE=azure `
+                                                                --from-literal=AZURE_MODEL2_OUTPUT_CONTAINER=${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}} `
+                                                                --from-literal=AZURE_STORAGE_WORKSPACE_CONTAINER=${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}} `
+                                                                --from-literal=READ="azure"  `
+                                                                --from-literal=WRITE="azure"  `
+                                                                --from-literal=BYPASS_DOTENV="1"
+
+                # because this is a job, not a deployment, we do not have to do the "kubectl rollout restart"
+                kubectl delete cronjob $(jobName)-cronjob    2>&1 | Out-Null
+                cd '$(Pipeline.Workspace)'
+                $jobManifestFile = ((gci -recurse $(jobManifest)) | select -first 1)
+                kubectl apply -f  $jobManifestFile.fullname
+
+          - task: AzureCLI@2
+            displayName: 'Run once and Check job progress'
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+              scriptType: 'pscore'
+              powerShellErrorActionPreference: continue
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+
+                echo "== Run once job =="
+                $timestamp= Get-Date -Format "yyyyMMddHHmm"
+                $jobname = "$(jobName)-runonce-rel-$(Build.BuildNumber)-time-$Timestamp"
+
+                kubectl create job --from=cronjob/$(jobName)-cronjob $jobname
+
+                # this step replaces the "wait" function in the kubernetes task, which is not
+                # working properly for extremely long runnign jobs..
+                write-host "kubernetes resources available:"
+
+                #for the logs
+                kubectl get pods  2>&1 
+                kubectl get jobs  2>&1
+                kubectl get services  2>&1
+
+                # there may be more than one job, scope to just the one this pipeline cares about
+                
+                  try {
+                      $podSpec = kubectl get pods --selector=job-name=$jobname  -o json 2> $null | convertfrom-json
+                      $podname = $podspec.items[0].metadata.name
+                  }  
+                      catch {}
+                
+                $completionTime=$null
+                $logs=""
+                $Failed = $false
+                while (-not $failed -and $podName -and -not $completionTime) {
+                
+                  $jobSpec = kubectl get jobs  --selector=job-name=$jobname  -o json 2> $null | convertfrom-json
+                  $completionTime = $jobspec.items[0].status.completionTime
+                  $success=$jobspec.items[0].status.succeeded
+                  $initFailed= ($pods.items | select -First 1).status.initContainerStatuses | where .state.reason -match 'Error' 
+                  $failed= (($job.status.conditions.type -eq 'Failed') -or $initFailed)
+
+                  $previouslogs = $logs
+                  $logs= kubectl logs $podname  --all-containers --timestamps  2> $null
+                  if ($logs -eq $null) { $logs=""}
+                  compare-object -PassThru $previouslogs $logs
+                
+                  if (-not   $completionTime) {
+                      write-output "waiting for job $jobname to complete..."
+                      sleep 60
+                  }
+                }
+                
+                if (-not $podname) {
+                    write-output("No pods found for job $jobname")
+                    exit 1
+                    }
+                
+                $logs > "$(Build.ArtifactStagingDirectory)/$($jobname).logs"
+                
+                if (-not ( $success -gt 0 )) {
+                    write-output("Job $jobname failed")
+                    exit 1
+                    }
+                  
+                  write-output("Job $jobname succeeded")
+                
+                  exit 0
+
+# Explaination:----------------------------------------------------------------------------------------------
+
+# File header / comment block
+# # deployScorejobmaifasts.yaml
+
+# # job variables from pipeline
+# #        $(jobName)
+# #        $(jobManifest)
+# #        input build pipelines
+
+
+# Comments describing intent: this template expects pipeline variables such as $(jobName) and $(jobManifest) to be supplied by the calling pipeline.
+
+# Nothing executable — just notes for the operator.
+
+# Parameters block
+# parameters:
+#   DEPLOYMENT_SERVICE_CONNECTION: 'NOT_DEFINE'
+#   NAMESPACE: 'NOT_DEFINE'
+#   AZURE_STORAGE_ACCOUNT: 'NOT_DEFINE'
+#   AZURE_STORAGE_ACCOUNT_SAS_TOKEN: 'NOT_DEFINE'
+#   ARTIFACT_NAME: 'NOT_DEFINE'
+#   AZURE_MODEL2_OUTPUT_CONTAINER: 'NOT_DEFINE'
+#   AZURE_STORAGE_WORKSPACE_CONTAINER: 'NOT_DEFINE'
+
+
+# parameters: → defines named parameters the template accepts when included by a pipeline.
+
+# Each following line defines one parameter and its default:
+
+# DEPLOYMENT_SERVICE_CONNECTION — name of the Azure DevOps service connection to use (subscription / credentials).
+
+# NAMESPACE — Kubernetes namespace to kubectl apply into.
+
+# AZURE_STORAGE_ACCOUNT — explicit Azure storage account name (optional; can be auto-derived).
+
+# AZURE_STORAGE_ACCOUNT_SAS_TOKEN — SAS token used when creating secrets (passed into K8s).
+
+# ARTIFACT_NAME — artifact name used later for publishing (if used).
+
+# AZURE_MODEL2_OUTPUT_CONTAINER — container name used by the training/scoring job (in configmap).
+
+# AZURE_STORAGE_WORKSPACE_CONTAINER — workspace container name used by jobs.
+
+# Defaults are 'NOT_DEFINE' so the template can detect when the pipeline caller did not override a parameter.
+
+# Steps: overall
+# steps:  
+#           - template: updateInstalls.yml  # Template reference
+
+
+# steps: — start of the pipeline steps for this template.
+
+# - template: updateInstalls.yml — includes another pipeline template named updateInstalls.yml (this installs tools like kubectl, kubelogin, etc.). It runs first.
+
+# Step: Get storage account name (AzureCLI@2)
+#           - task: AzureCLI@2
+#             displayName: Get storage account name
+#             inputs:
+#               azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}' 
+#               scriptType: 'pscore'
+#               scriptLocation: 'inlineScript'
+#               addSpnToEnvironment: true
+#               inlineScript: |
+
+
+# task: AzureCLI@2 — runs Azure CLI inside an Azure DevOps task.
+
+# displayName — human-friendly label shown in pipeline UI.
+
+# inputs:
+
+# azureSubscription — uses the parameter DEPLOYMENT_SERVICE_CONNECTION (the service connection).
+
+# scriptType: 'pscore' — run PowerShell Core.
+
+# scriptLocation: 'inlineScript' — script is embedded here in YAML.
+
+# addSpnToEnvironment: true — place service principal creds in env variables for use by the script.
+
+# inlineScript: | — beginning of the PowerShell script block.
+
+# Now the inline PowerShell content:
+
+#                  gci -recurse * | select directory, name
+
+#                  gci env: |  where Name -notmatch token | format-table -wrap
+
+
+# gci -recurse * | select directory, name — lists files in the current workspace (debug / visibility).
+
+# gci env: | where Name -notmatch token | format-table -wrap — lists environment variables but filters out names that match token (avoid printing tokens), formats output.
+
+#                  $storageAccounts=(az resource list -o json | convertfrom-json) | where type -eq "Microsoft.Storage/storageAccounts"
+#                  $storageAccounts | format-table
+
+
+# az resource list -o json | convertfrom-json — lists Azure resources in the subscription, converts JSON to PowerShell objects.
+
+# | where type -eq "Microsoft.Storage/storageAccounts" — filters for Storage Accounts only.
+
+# $storageAccounts now holds the storage accounts; format-table prints them.
+
+#                  $AzureStorageAccount='${{parameters.AZURE_STORAGE_ACCOUNT}}'
+
+
+# Assigns the parameter value AZURE_STORAGE_ACCOUNT to local PowerShell variable $AzureStorageAccount.
+
+#                  # if a specific storage account was not specified, take the storage account from the service connection
+#                  if ($AzureStorageAccount -eq 'NOT_DEFINE') {
+#                     $AzureStorageAccount = ($storageAccounts | select -First 1).name                   
+#                     }
+
+
+# If the pipeline parameter was left NOT_DEFINE, default to the first storage account discovered from the subscription. This is a fallback.
+
+#                  Write-Host "##vso[task.setvariable variable=AzureStorageAccount;]$AzureStorageAccount"
+#                  Write-host "using storage account $AzureStorageAccount"
+
+
+# Write-Host "##vso[task.setvariable ...]" — special DevOps logging command that creates/sets a pipeline variable AzureStorageAccount with the chosen storage account name (so later steps can reference $(AzureStorageAccount)).
+
+# Then prints a human-friendly message.
+
+# Step: Check Environment variables (PowerShell@2)
+#           - task: PowerShell@2
+#             displayName: 'Check Environment variables'
+#             inputs:
+#                 targetType: 'inline'
+#                 script: |
+#                   # Write your PowerShell commands here.
+                      
+#                   gci env: | format-table -wrap
+#                   gci  -recurse | select fullname
+
+
+# task: PowerShell@2 — runs PowerShell (on agent).
+
+# displayName — label.
+
+# inputs.targetType: inline — inline script provided.
+
+# Script body:
+
+# gci env: | format-table -wrap — prints environment variables for debugging.
+
+# gci -recurse | select fullname — lists files recursively in working directory (debug visibility).
+
+# This step is purely diagnostic/debug to show environment and workspace contents.
+
+# Step: Get AKS cluster name (AzureCLI@2)
+#           - task: AzureCLI@2
+#             displayName: Get aks cluster name
+#             inputs:
+#               azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+#               scriptType: 'pscore'
+#               scriptLocation: 'inlineScript'
+#               addSpnToEnvironment: true
+#               inlineScript: |
+
+
+# Another Azure CLI PowerShell step. Purpose: detect AKS (Azure Kubernetes Service) cluster to connect to.
+
+# Inline script:
+
+#                 # we arent using az aks list anymore as it's not working consistently in all environments
+#                 $resources = az resource list -o json | convertfrom-json       
+#                 $aksList = $resources | where 'type' -eq 'Microsoft.ContainerService/managedClusters'
+#                 $aksList | format-table
+
+
+# Lists resources and filters for AKS clusters (Microsoft.ContainerService/managedClusters), prints them.
+
+#                 $aksName='$(aksName)'
+#                 $aksResourceGroup='$(aksResourceGroup)'
+
+
+# Reads pipeline variables $(aksName) and $(aksResourceGroup) into local PowerShell variables (these may be set by the pipeline or left as placeholders like set in script).
+
+#                 # use specific aks is named, otherwise derive from service connection permissions
+#                 if (('set in script' -eq $aksResourceGroup) -or ('set in script' -eq $aksName))
+#                 {
+#                   write-host "Setting aks from service connection environment"
+#                   $aksName = ($aksList | select -First 1).name
+#                   $aksResourceGroup= ($aksList | select -First 1).resourceGroup
+#                 }
+
+
+# If aksName/aksResourceGroup equal the placeholder set in script, pick the first AKS cluster from $aksList and set $aksName and $aksResourceGroup accordingly. This is a fallback behavior.
+
+#                 Write-host "using aks $aksName resource group $aksResourceGroup "
+#                 Write-Host "##vso[task.setvariable variable=aksName;]$aksName"
+#                 Write-Host "##vso[task.setvariable variable=aksResourceGroup;]$aksResourceGroup"
+
+
+# Print and then set DevOps pipeline variables aksName and aksResourceGroup for later steps.
+
+# Step: use kubelogin to connect (AzureCLI@2, bash)
+#           - task: AzureCLI@2
+#             displayName: use kubelogin to connect
+#             inputs:
+#               azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+#               scriptType: 'bash'
+#               scriptLocation: 'inlineScript'
+#               inlineScript: |
+
+
+# AzureCLI task but running a bash script this time — used to fetch kubeconfig and convert it for Azure AD login.
+
+# Inline bash:
+
+#                 Write-host "using aks $(aksName) resource group $(aksResourceGroup)"
+#                 rm -f ".kube/config" &&  az aks get-credentials --resource-group '$(aksResourceGroup)' \
+#                       --name '$(aksName)' \
+#                       --overwrite-existing 
+
+
+# Log which AKS cluster is used.
+
+# Remove any existing .kube/config then run az aks get-credentials to pull kubeconfig for the specified AKS cluster into the agent's .kube/config.
+
+#                 kubelogin convert-kubeconfig -l azurecli
+
+
+# kubelogin convert-kubeconfig -l azurecli — converts kubeconfig to use Azure AD authentication (so kubectl will use Azure CLI / kubelogin for auth).
+
+#                 kubectl config set-context --current --namespace '${{parameters.NAMESPACE}}'
+
+
+# Sets the current kubectl context to use the NAMESPACE parameter — so subsequent kubectl commands operate in that namespace.
+
+#                 kubectl get pods 2>&1
+
+
+# Lists pods (quick check to validate connectivity).
+
+# Step: apply manifest (AzureCLI@2)
+#           - task: AzureCLI@2
+#             displayName: apply manifest
+#             inputs:
+#               azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+#               scriptType: 'pscore'
+#               powerShellErrorActionPreference: continue
+#               scriptLocation: 'inlineScript'
+#               inlineScript: |
+
+
+# This step creates K8s secrets/configmaps and applies the job manifest into the cluster.
+
+# powerShellErrorActionPreference: continue — continue on non-terminating errors.
+
+# Inline PowerShell:
+
+#                 kubectl delete secret         $(jobName)-secret  2>&1 | Out-Null
+#                 kubectl create secret generic $(jobName)-secret --from-literal=AZURE_SAS_TOKEN='${{parameters.AZURE_STORAGE_ACCOUNT_SAS_TOKEN}}'
+
+
+# Delete any existing secret named $(jobName)-secret (silenced), then create a new Kubernetes generic secret with literal AZURE_SAS_TOKEN set to the parameter value. This injects the SAS token into the job's secret.
+
+#                 kubectl delete configmap      $(jobName)-config  2>&1 | Out-Null
+#                 kubectl create configmap      $(jobName)-config --from-literal=AZURE_STORAGE_ACCOUNT=$(AzureStorageAccount) `
+#                                                                 --from-literal=WORKSPACE=azure `
+#                                                                 --from-literal=AZURE_MODEL2_OUTPUT_CONTAINER=${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}} `
+#                                                                 --from-literal=AZURE_STORAGE_WORKSPACE_CONTAINER=${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}} `
+#                                                                 --from-literal=READ="azure"  `
+#                                                                 --from-literal=WRITE="azure"  `
+#                                                                 --from-literal=BYPASS_DOTENV="1"
+
+
+# Delete any existing ConfigMap $(jobName)-config, then create a new ConfigMap with multiple --from-literal key/value pairs:
+
+# AZURE_STORAGE_ACCOUNT — uses pipeline variable $(AzureStorageAccount) set earlier.
+
+# WORKSPACE=azure — indicates workspace type.
+
+# AZURE_MODEL2_OUTPUT_CONTAINER — from template parameter.
+
+# AZURE_STORAGE_WORKSPACE_CONTAINER — from template parameter.
+
+# READ/WRITE — both set to "azure" (job reads/writes Azure).
+
+# BYPASS_DOTENV=1 — skip .env handling inside container.
+
+# Backticks ``` are PowerShell line-continuation characters to break a long command across lines.
+
+#                 # because this is a job, not a deployment, we do not have to do the "kubectl rollout restart"
+#                 kubectl delete cronjob $(jobName)-cronjob    2>&1 | Out-Null
+#                 cd '$(Pipeline.Workspace)'
+#                 $jobManifestFile = ((gci -recurse $(jobManifest)) | select -first 1)
+#                 kubectl apply -f  $jobManifestFile.fullname
+
+
+# Deletes any existing CronJob named $(jobName)-cronjob (cleanup) — because the pipeline will either apply a job manifest or re-create the cronjob.
+
+# cd '$(Pipeline.Workspace)' — ensure we are in the pipeline workspace where artifacts were downloaded.
+
+# $jobManifestFile = ((gci -recurse $(jobManifest)) | select -first 1) — find the manifest file matching $(jobManifest) pattern in the workspace.
+
+# kubectl apply -f $jobManifestFile.fullname — apply that manifest to the cluster (this creates the CronJob/Job as defined by the manifest).
+
+# Step: Run once and Check job progress (AzureCLI@2)
+#           - task: AzureCLI@2
+#             displayName: 'Run once and Check job progress'
+#             inputs:
+#               azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+#               scriptType: 'pscore'
+#               powerShellErrorActionPreference: continue
+#               scriptLocation: 'inlineScript'
+#               inlineScript: |
+
+
+# This step creates a run-once job from the applied CronJob and then polls the cluster until completion, streaming logs and failing the pipeline if the job fails.
+
+# Inline PowerShell breakdown:
+
+#                 echo "== Run once job =="
+#                 $timestamp= Get-Date -Format "yyyyMMddHHmm"
+#                 $jobname = "$(jobName)-runonce-rel-$(Build.BuildNumber)-time-$Timestamp"
+
+
+# Prints header.
+
+# Computes $timestamp in format YYYYMMDDhhmm.
+
+# Builds $jobname as $(jobName)-runonce-rel-$(Build.BuildNumber)-time-$Timestamp for unique job name. Note: $Timestamp uses same case as variable defined — PowerShell is case-insensitive, so ok.
+
+#                 kubectl create job --from=cronjob/$(jobName)-cronjob $jobname
+
+
+# Creates a Job derived from the CronJob $(jobName)-cronjob, with name $jobname. This runs the scheduled task immediately as a one-off Job.
+
+#                 # this step replaces the "wait" function in the kubernetes task, which is not
+#                 # working properly for extremely long runnign jobs..
+#                 write-host "kubernetes resources available:"
+
+
+# Comment explains why they are implementing custom polling (some K8s tasks don't wait reliably for long-running jobs). Then prints a header.
+
+#                 #for the logs
+#                 kubectl get pods  2>&1 
+#                 kubectl get jobs  2>&1
+#                 kubectl get services  2>&1
+
+
+# Show pods/jobs/services as basic diagnostics.
+
+#                 # there may be more than one job, scope to just the one this pipeline cares about
+                
+#                   try {
+#                       $podSpec = kubectl get pods --selector=job-name=$jobname  -o json 2> $null | convertfrom-json
+#                       $podname = $podspec.items[0].metadata.name
+#                   }  
+#                       catch {}
+
+
+# Try to find the Pod launched by the job by using the label selector job-name=$jobname and parse JSON to get the pod name.
+
+# $podname will be the first pod's metadata.name. Wrapped in try to avoid hard failure if not immediately present.
+
+#                 $completionTime=$null
+#                 $logs=""
+#                 $Failed = $false
+
+
+# Initialize state variables for the watch loop.
+
+#                 while (-not $failed -and $podName -and -not $completionTime) {
+                
+#                   $jobSpec = kubectl get jobs  --selector=job-name=$jobname  -o json 2> $null | convertfrom-json
+#                   $completionTime = $jobspec.items[0].status.completionTime
+#                   $success=$jobspec.items[0].status.succeeded
+#                   $initFailed= ($pods.items | select -First 1).status.initContainerStatuses | where .state.reason -match 'Error' 
+#                   $failed= (($job.status.conditions.type -eq 'Failed') -or $initFailed)
+
+
+# Poll loop continues while:
+
+# Not failed,
+
+# Pod exists,
+
+# and job hasn't completed.
+
+# Inside loop:
+
+# $jobSpec — fetch job status JSON by selector.
+
+# $completionTime — read status.completionTime if set (non-null indicates completion).
+
+# $success — read status.succeeded count (how many pods succeeded).
+
+# $initFailed — attempt to find any initContainer failures (inspects initContainerStatuses for state.reason matching 'Error').
+
+# $failed — set to true if job reports failure condition or any init container failed.
+
+# Note: script references $pods and $job variables not explicitly created in every path; in some environments these names may come from earlier commands (or this script may rely on implicit objects). In practice this works often but can be brittle — see “gotchas” at the end.
+
+#                   $previouslogs = $logs
+#                   $logs= kubectl logs $podname  --all-containers --timestamps  2> $null
+#                   if ($logs -eq $null) { $logs=""}
+#                   compare-object -PassThru $previouslogs $logs
+
+
+# Capture logs each iteration; compare-object used to print the diff between previous logs and current so the pipeline UI only shows new lines.
+
+#                   if (-not   $completionTime) {
+#                       write-output "waiting for job $jobname to complete..."
+#                       sleep 60
+#                   }
+#                 }
+
+
+# If not completed yet, print waiting and sleep 60 seconds, then loop.
+
+#                 if (-not $podname) {
+#                     write-output("No pods found for job $jobname")
+#                     exit 1
+#                     }
+
+
+# If no pod was found at all, fail the pipeline (exit 1).
+
+#                 $logs > "$(Build.ArtifactStagingDirectory)/$($jobname).logs"
+
+
+# Write the collected logs into the pipeline’s Artifact Staging Directory as <jobname>.logs so the pipeline publishes it as an artifact.
+
+#                 if (-not ( $success -gt 0 )) {
+#                     write-output("Job $jobname failed")
+#                     exit 1
+#                     }
+                  
+#                   write-output("Job $jobname succeeded")
+                
+#                   exit 0
+
+
+# If the job did not report any successful pod ($success -gt 0), mark the pipeline step as failed (exit 1). Otherwise print success and exit 0 (success).
+
+# Short summary of what this template does (end-to-end)
+
+# Ensure required client tools are installed (via updateInstalls.yml).
+
+# Determine which Azure Storage account to use (parameter or auto-discover).
+
+# Validate environment and workspace.
+
+# Detect / select an AKS cluster to operate on; set pipeline variables aksName and aksResourceGroup.
+
+# Retrieve kubeconfig for the cluster and configure kubelogin for Azure AD auth; set kubectl namespace.
+
+# Create or update a Kubernetes Secret containing the Azure SAS token and a ConfigMap containing relevant container/target info.
+
+# Find the job manifest artifact in $(Pipeline.Workspace) and kubectl apply -f to create CronJob/Job in AKS.
+
+# Optionally run the CronJob once immediately by creating a Job from the CronJob and polling the job/pod status/logs until completion; publish logs as pipeline artifact and fail the pipeline if the job fails.
+
+# Gotchas & suggestions (helpful notes)
+
+# Many kubectl/az commands assume agent has required CLI tools and auth installed — the included updateInstalls.yml is meant to ensure that.
+
+# Some PowerShell variables used in the poll loop are referenced before they are guaranteed to exist (e.g., $pods, $job). PowerShell is forgiving, but that can make the script brittle in some agent environments. Consider tightening:
+
+# explicitly set $pods = kubectl get pods ... before referencing,
+
+# verify $jobSpec exists before referencing $jobspec.items[0].
+
+# The script uses Write-Host "##vso[task.setvariable ...]" to set pipeline variables; this is the correct way to propagate values to later steps.
+
+# Consider adding explicit backoffLimit or activeDeadlineSeconds to Job manifests so jobs don’t retry forever or hang.
+
+# Be cautious with echoing environment in logs — ensure no secrets are printed (they attempted to filter -notmatch token, but secret names can vary).
+

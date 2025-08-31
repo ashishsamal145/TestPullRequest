@@ -1,0 +1,235 @@
+# m3-model-training-job.yaml
+
+apiVersion: batch/v1
+kind: Job
+# kind: CronJob
+metadata:
+        name: m3-model-training-sequenced-job-{TRAIN_TIMESTAMP}
+spec:
+#       uncomment if cronjob
+#        schedule: "*/1 * * * *"
+#        concurrencyPolicy: Forbid 
+
+        ttlSecondsAfterFinished: 3600  # logs are in devops - no reason to keep the job after completion
+        template:
+          metadata:
+            name: model-training-sequenced-job-{TRAIN_TIMESTAMP}
+          spec:
+      # would be nice to have 
+      #      securityContext:
+      #        runAsUser: 1001
+      #        fsGroup: 1001 
+            initContainers:
+            - name: revenue-prediction-m1-m2-train
+              image: rtirevenueprediction.azurecr.io/revenue-prediction-m3-train:latest
+              # memory request forces job/pod to the larger node pool
+              imagePullPolicy: IfNotPresent
+              resources:
+                requests:
+                  memory: "8000Mi"
+              env:
+              # moving this to the config map will prevent parallel runs. so leave it here even though it's common
+              - name: TIMESTAMP
+                value: "{TRAIN_TIMESTAMP}"
+              - name: READ
+                value: "azure"
+              - name: WRITE
+                value: "azure"
+              - name: BYPASS_DOTENV
+                value: "1"
+              envFrom:
+              # kubernetes secret loaded from build pipeline
+              - secretRef:
+                  name: m3-model-training-secret
+              - configMapRef:
+                  name: m3-model-training-config
+            containers:
+            - name: job-done
+              image: busybox
+              command: ['sh', '-c', 'echo "training completed"']
+            dnsPolicy: ClusterFirst
+            restartPolicy: Never
+
+
+# ========================================================================
+
+# Explanation:----------------------------------------------------------------------------------------
+
+# 📄 File: m3-model-training-job.yaml
+# apiVersion: batch/v1
+
+
+# Uses the batch/v1 API group.
+
+# This is required for Job or CronJob workloads in Kubernetes.
+
+# kind: Job
+# # kind: CronJob
+
+
+# kind: Job → Runs a one-off batch job until completion.
+
+# Comment shows: you could switch it to CronJob if you wanted it to run on a schedule.
+
+# metadata:
+#         name: m3-model-training-sequenced-job-{TRAIN_TIMESTAMP}
+
+
+# Job name = m3-model-training-sequenced-job-{TRAIN_TIMESTAMP}.
+
+# {TRAIN_TIMESTAMP} is a placeholder that gets replaced (probably by CI/CD pipeline) with a real timestamp (e.g., 202308251045).
+
+# Ensures unique job names per training run.
+
+# spec:
+# #       uncomment if cronjob
+# #        schedule: "*/1 * * * *"
+# #        concurrencyPolicy: Forbid 
+
+
+# If this were a CronJob, schedule would define how often it runs (*/1 * * * * = every minute).
+
+# concurrencyPolicy: Forbid ensures only one instance runs at a time (no overlapping training jobs).
+
+# Currently commented because this is a Job, not a CronJob.
+
+#         ttlSecondsAfterFinished: 3600  # logs are in devops - no reason to keep the job after completion
+
+
+# Tells Kubernetes to garbage collect the Job 3600 seconds (1 hour) after completion.
+
+# Since logs are already exported to DevOps, there’s no need to keep the Job object around forever.
+
+# Pod Template
+
+# This defines the Pod(s) that the Job will run.
+
+#         template:
+#           metadata:
+#             name: model-training-sequenced-job-{TRAIN_TIMESTAMP}
+
+
+# Pod name = model-training-sequenced-job-{TRAIN_TIMESTAMP}.
+
+# Again timestamped for uniqueness.
+
+#           spec:
+#       # would be nice to have 
+#       #      securityContext:
+#       #        runAsUser: 1001
+#       #        fsGroup: 1001 
+
+
+# Pod spec begins here.
+
+# Commented securityContext → would allow running as a non-root user (1001).
+
+# Currently disabled, but would be best practice for security.
+
+# Init Container
+#             initContainers:
+#             - name: revenue-prediction-m1-m2-train
+#               image: rtirevenueprediction.azurecr.io/revenue-prediction-m3-train:latest
+
+
+# Defines an initContainer that runs before the main container(s).
+
+# Runs revenue-prediction-m3-train:latest (stored in Azure Container Registry).
+
+# Likely performs the model training work.
+
+#               # memory request forces job/pod to the larger node pool
+#               imagePullPolicy: IfNotPresent
+#               resources:
+#                 requests:
+#                   memory: "8000Mi"
+
+
+# Memory-heavy workload: requests 8 GB RAM.
+
+# This will force scheduling onto a larger node pool.
+
+# IfNotPresent avoids re-pulling the image if already cached.
+
+# Environment Variables
+#               env:
+#               - name: TIMESTAMP
+#                 value: "{TRAIN_TIMESTAMP}"
+#               - name: READ
+#                 value: "azure"
+#               - name: WRITE
+#                 value: "azure"
+#               - name: BYPASS_DOTENV
+#                 value: "1"
+
+
+# Sets runtime environment:
+
+# TIMESTAMP → injected timestamp (e.g., 20230825...) for tracking.
+
+# READ=azure, WRITE=azure → tells the training job to read/write from Azure storage.
+
+# BYPASS_DOTENV=1 → bypasses local .env file loading (likely uses K8s secrets/config instead).
+
+#               envFrom:
+#               - secretRef:
+#                   name: m3-model-training-secret
+#               - configMapRef:
+#                   name: m3-model-training-config
+
+
+# Loads additional environment variables from:
+
+# Secret m3-model-training-secret → credentials (keys, passwords, etc.).
+
+# ConfigMap m3-model-training-config → non-sensitive config (paths, parameters, etc.).
+
+# Main Container
+#             containers:
+#             - name: job-done
+#               image: busybox
+#               command: ['sh', '-c', 'echo "training completed"']
+
+
+# After the initContainer finishes, a dummy container runs.
+
+# It just prints "training completed".
+
+# Purpose: mark the Job as complete.
+
+# The real work was done in the initContainer (m3-train).
+
+# Networking & Restart Policy
+#             dnsPolicy: ClusterFirst
+
+
+# Default DNS policy (use cluster DNS first, then fallback to node DNS).
+
+#             restartPolicy: Never
+
+
+# Do not restart containers once they exit.
+
+# If initContainer or main container fails, the Job will fail.
+
+# This makes sense for training jobs: they should run once, succeed or fail, not restart endlessly.
+
+# 🚀 Summary
+
+# This YAML defines a Kubernetes Job that runs an M3 model training process once and then exits.
+
+# Runs a timestamped Job → unique per training run.
+
+# Training logic is in an initContainer (revenue-prediction-m3-train).
+
+# Uses 8 GB RAM, runs only once.
+
+# Reads/writes to Azure storage.
+
+# Injects secrets & configs as environment variables.
+
+# Main container just marks completion (echo "training completed").
+
+# Job auto-deletes after 1 hour.
+
+# restartPolicy: Never ensures no retries, just a one-shot execution.

@@ -1,0 +1,543 @@
+# consolidated_aks_scoring_deployment.yaml
+
+trigger: 
+ paths:
+  include:
+   - scoring-pipeline-azure.yml
+   - pipeline-templates
+   - deployment 
+ branches:
+  include:
+   - master
+   - main
+   - develop
+parameters:
+- name: AZURE_MODEL2_OUTPUT_CONTAINER
+  displayName: AZURE_MODEL2_OUTPUT_CONTAINER
+  type: string
+  default: model2-output
+- name: AZURE_STORAGE_WORKSPACE_CONTAINER
+  displayName: AZURE_STORAGE_WORKSPACE_CONTAINER
+  type: string
+  default: autotrain-workspace
+# Pipeline triggered by a pipeline
+resources:
+  pipelines:
+   - pipeline: m1m2sourcescorebuild
+     project: "Revenue Prediction"
+     source: "[Build] M1M2 score image"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+   - pipeline: m3sourcescorebuild
+     project: "Revenue Prediction"
+     source: "[Build] M3 score image"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+   - pipeline: m4sourcescorebuild
+     project: "Revenue Prediction"
+     source: "[Build] M4 score image"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+   - pipeline: m5sourcescorebuild
+     project: "Revenue Prediction"
+     source: "[Build] M5 score image"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+   - pipeline: m1m2sourcetrainartifactbuild
+     project: "Revenue Prediction"
+     source: "[Build] M1M2 train artifact"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+   - pipeline: m3sourcetrainartifactbuild
+     project: "Revenue Prediction"
+     source: "[Build] M3 train artifact"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+   - pipeline: m4sourcetrainartifactbuild
+     project: "Revenue Prediction"
+     source: "[Build] M4 train artifact"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+variables:
+- group: 'Azure Variables'
+- name: scoreTimestamp
+  value: SetByInitialStage
+- name: scoreImageName
+  value: revenue-prediction-m1-m2-score
+- name: jobName
+  value: model-scoring
+- name: jobManifest
+  value: model-scoring-job.yaml
+- name: m1m2ScoreImageName
+  value: rtirevenueprediction.azurecr.io/revenue-prediction-m1-m2
+- name: m3ScoreImageName
+  value: rtirevenueprediction.azurecr.io/revenue-prediction-m3-score
+- name: m4ScoreImageName
+  value: rtirevenueprediction.azurecr.io/revenue-prediction-m4-score
+- name: m5ScoreImageName
+  value: rtirevenueprediction.azurecr.io/revenue-prediction-m5
+- name: m1-m2-score-at-main
+  value: $[or(eq(variables['resources.pipeline.m1m2sourcescorebuild.sourceBranch'], 'refs/heads/main'), eq(variables['resources.pipeline.m1m2sourcescorebuild.sourceBranch'], 'refs/heads/master'))]
+- name: m3-score-at-main
+  value: $[or(eq(variables['resources.pipeline.m3sourcescorebuild.sourceBranch'], 'refs/heads/main'), eq(variables['resources.pipeline.m3sourcescorebuild.sourceBranch'], 'refs/heads/master'))]
+- name: m4-score-at-main
+  value: $[or(eq(variables['resources.pipeline.m4sourcescorebuild.sourceBranch'], 'refs/heads/main'), eq(variables['resources.pipeline.m4sourcescorebuild.sourceBranch'], 'refs/heads/master'))]
+- name: m5-score-at-main
+  value: $[or(eq(variables['resources.pipeline.m5sourcescorebuild.sourceBranch'], 'refs/heads/main'), eq(variables['resources.pipeline.m5sourcescorebuild.sourceBranch'], 'refs/heads/master'))]
+- name: score-at-main
+  value: $[and(and(and(eq(variables['m1-m2-score-at-main'],'True'), eq(variables['m3-score-at-main'],'True')),eq(variables['m4-score-at-main'],'True')),eq(variables['m5-score-at-main'],'True'))]
+- name: m1-m2-train-artifact-at-main
+  value: $[or(eq(variables['resources.pipeline.m1m2sourcetrainartifactbuild.sourceBranch'], 'refs/heads/main'), eq(variables['resources.pipeline.m1m2sourcetrainartifactbuild.sourceBranch'], 'refs/heads/master'))]
+- name: m3-train-artifact-at-main
+  value: $[or(eq(variables['resources.pipeline.m3sourcetrainartifactbuild.sourceBranch'], 'refs/heads/main'), eq(variables['resources.pipeline.m3sourcetrainartifactbuild.sourceBranch'], 'refs/heads/master'))]
+- name: m4-train-artifact-at-main
+  value: $[or(eq(variables['resources.pipeline.m4sourcetrainartifactbuild.sourceBranch'], 'refs/heads/main'), eq(variables['resources.pipeline.m4sourcetrainartifactbuild.sourceBranch'], 'refs/heads/master'))]
+- name: train-artifact-at-main
+  value: $[and(and(eq(variables['m1-m2-train-artifact-at-main'],'True'), eq(variables['m3-train-artifact-at-main'],'True')),eq(variables['m4-train-artifact-at-main'],'True'))]
+- name: all-pipelines-at-main
+  value: $[and(eq(variables['score-at-main'],'True'), eq(variables['train-artifact-at-main'],'True'))]
+- name: trainTimestamp
+  value: setInScript
+- name: m3trainTimestamp
+  value: setInScript
+- name: m4trainTimestamp
+  value: setInScript
+stages:
+- stage: SetTimestamp
+  displayName: Set the Timestamp for the scoring data and Prepare the Yaml
+  jobs:  
+  - job: Prepare
+    displayName: Prepare
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    steps:
+    - download: m1m2sourcetrainartifactbuild
+      artifact: devresults
+    - download: m3sourcetrainartifactbuild
+      artifact: devresults
+    - download: m4sourcetrainartifactbuild
+      artifact: devresults
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: 'gci env:RESOURCES* | Sort-Object -Property key | format-table -wrap'
+      displayName: 'Display environment'
+    - bash: |
+        find .
+        train_TIMESTAMP=`cat $(PIPELINE.WORKSPACE)/m1m2sourcetrainartifactbuild/devresults/TrainTimestamp.txt`
+        # expose timestamp in build variable
+        echo "##vso[task.setvariable variable=trainTimestamp]${train_TIMESTAMP}" 
+        m3_train_TIMESTAMP=`cat $(PIPELINE.WORKSPACE)/m3sourcetrainartifactbuild/devresults/TrainTimestamp.txt`
+        # expose timestamp in build variable
+        echo "##vso[task.setvariable variable=m3trainTimestamp]${m3_train_TIMESTAMP}" 
+        m4_train_TIMESTAMP=`cat $(PIPELINE.WORKSPACE)/m4sourcetrainartifactbuild/devresults/TrainTimestamp.txt`
+        # expose timestamp in build variable 
+        echo "##vso[task.setvariable variable=m4trainTimestamp]${m4_train_TIMESTAMP}"                 
+      displayName: 'Set training timestamp'
+    - bash: |
+        echo "trainTimestamp is [$(trainTimestamp)]"   
+        echo "m3trainTimestamp is [$(m3trainTimestamp)]"  
+        echo "m4trainTimestamp is [$(m4trainTimestamp)]" 
+        echo "m1-m2-score-at-main for [$(resources.pipeline.m1m2sourcescorebuild.sourceBranch)] is [$(m1-m2-score-at-main)]"  
+        echo "m3-score-at-main for [$(resources.pipeline.m3sourcescorebuild.sourceBranch)] is [$(m3-score-at-main)]"  
+        echo "m4-score-at-main for [$(resources.pipeline.m4sourcescorebuild.sourceBranch)] is [$(m4-score-at-main)]"  
+        echo "m5-score-at-main for [$(resources.pipeline.m5sourcescorebuild.sourceBranch)] is [$(m5-score-at-main)]"  
+        echo "score-at-main is [$(score-at-main)]"  
+        echo "m1-m2-train-artifact-at-main for [$(resources.pipeline.m1m2sourcetrainartifactbuild.sourceBranch)] is [$(m1-m2-train-artifact-at-main)]"  
+        echo "m3-train-artifact-at-main for [$(resources.pipeline.m3sourcetrainartifactbuild.sourceBranch)] is [$(m3-train-artifact-at-main)]"  
+        echo "m4-train-artifact-at-main for [$(resources.pipeline.m4sourcetrainartifactbuild.sourceBranch)] is [$(m4-train-artifact-at-main)]"  
+        echo "train-artifact-at-main is [$(train-artifact-at-main)]"  
+        echo "all-pipelines-at-main is [$(all-pipelines-at-main)]" 
+      displayName: 'Show results of train timestamp'
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: |
+            # no need to set up storage containers - training will have done this first
+
+            # create a manifest which reflects the correct build
+            # the following elements need to be replaced: 
+            # {score_TIMESTAMP}
+            # {train_TIMESTAMP}
+            # {M3_train_TIMESTAMP}
+            # {M4_train_TIMESTAMP}"
+            # $(m12ScoreImageName):latest
+            # $(m3ScoreImageName):latest
+            # $(m4ScoreImageName):latest
+            # $(m5ScoreImageName):latest     
+
+            write-host '{TRAIN_TIMESTAMP}= $(trainTimestamp)' 
+            write-host '{M3_TRAIN_TIMESTAMP}= $(m3trainTimestamp)' 
+            write-host '{M4_TRAIN_TIMESTAMP}= $(m4trainTimestamp)' 
+            write-host 'm1m2ScoreImageName= $(m1m2ScoreImageName):$(resources.pipeline.m1m2sourcescorebuild.runName)' 
+            write-host 'm3ScoreImageName= $(m3ScoreImageName):$(resources.pipeline.m3sourcescorebuild.runName)' 
+            write-host 'm4ScoreImageName= $(m4ScoreImageName):$(resources.pipeline.m4sourcescorebuild.runName)' 
+            write-host 'm5ScoreImageName= $(m5ScoreImageName):$(resources.pipeline.m5sourcescorebuild.runName)' 
+
+            $manifestfile = (gci -recurse $(jobManifest) ) | select -first 1
+            $manifest = (gc $manifestfile) `
+               -replace '{TRAIN_TIMESTAMP}',                   '$(trainTimestamp)' `
+               -replace '{M3_TRAIN_TIMESTAMP}',                '$(m3trainTimestamp)' `
+               -replace '{M4_TRAIN_TIMESTAMP}',                '$(m4trainTimestamp)' `
+               -replace '$(m1m2ScoreImageName):.[^/s]*','$(m1m2ScoreImageName):$(resources.pipeline.m1m2sourcescorebuild.runName)' `
+               -replace '$(m3ScoreImageName):.[^/s]*',   '$(m3ScoreImageName):$(resources.pipeline.m3sourcescorebuild.runName)' `
+               -replace '$(m4ScoreImageName):.[^/s]*',   '$(m4ScoreImageName):$(resources.pipeline.m4sourcescorebuild.runName)' `
+               -replace '$(m5ScoreImageName):.[^/s]*',   '$(m5ScoreImageName):$(resources.pipeline.m5sourcescorebuild.runName)' `
+               > $(Build.ArtifactStagingDirectory)/$(jobManifest)
+      
+            gc $(Build.ArtifactStagingDirectory)/$(jobManifest)
+
+
+    - publish: '$(Build.ArtifactStagingDirectory)'
+      displayName: 'Publish yaml file for inspection'
+      artifact: kubernetes
+                  
+- stage: Devscore
+  displayName: Dev- Deploy scoring cronjob
+  dependsOn: SetTimestamp
+  variables:
+    aksName: 'set in script'
+    aksResourceGroup: 'set in script'
+    namespace: 'set in script'
+    AzureStorageAccount: 'set in script'
+  jobs:  
+  - deployment: scoring
+    environment: development
+    displayName: Deploy scoring cronjob
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: 'current'
+              artifactName: 'kubernetes'
+              targetPath: '$(Pipeline.Workspace)'
+          - template: ./pipeline-templates/deployScoreJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-dev-AKSLOWDEVPRV001
+              NAMESPACE: cfo-apps-revpred-dev
+              AZURE_STORAGE_ACCOUNT: revpredtempblobdev
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenDev)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: devscoreresults
+- stage: Prodscore
+  displayName: Production- Deploy scoring cronjob
+  dependsOn: Devscore
+  condition: and(succeeded(), eq(variables['all-pipelines-at-main'],'true'))
+  variables:
+    aksName: 'set in script'
+    aksResourceGroup: 'set in script'
+    namespace: 'set in script'
+    AzureStorageAccount: 'set in script'
+  jobs:  
+  - deployment: scoring
+    environment: production
+    displayName: Deploy scoring cronjob
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: 'current'
+              artifactName: 'kubernetes'
+              targetPath: '$(Pipeline.Workspace)'
+          - template: pipeline-templates/deployScoreJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-prod-AKSLOWPRODPRV002
+              NAMESPACE: cfo-apps-revpred-prod
+              AZURE_STORAGE_ACCOUNT: revpredtempblob
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenProd)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: prodscoreresults
+
+
+# Explanation:--------------------------------------------------------------------------------------
+
+# .
+
+# # consolidated_aks_scoring_deployment.yaml
+
+
+# Comment: filename/document title.
+
+# Trigger section
+# trigger: 
+#  paths:
+#   include:
+#    - scoring-pipeline-azure.yml
+#    - pipeline-templates
+#    - deployment 
+#  branches:
+#   include:
+#    - master
+#    - main
+#    - develop
+
+
+# Defines when this pipeline runs automatically.
+
+# It will trigger when files under scoring-pipeline-azure.yml, pipeline-templates, or deployment are modified.
+
+# Only on branches: master, main, or develop.
+
+# Parameters
+# parameters:
+# - name: AZURE_MODEL2_OUTPUT_CONTAINER
+#   displayName: AZURE_MODEL2_OUTPUT_CONTAINER
+#   type: string
+#   default: model2-output
+# - name: AZURE_STORAGE_WORKSPACE_CONTAINER
+#   displayName: AZURE_STORAGE_WORKSPACE_CONTAINER
+#   type: string
+#   default: autotrain-workspace
+
+
+# Pipeline input parameters (can be overridden at runtime).
+
+# These define which storage containers in Azure will be used.
+
+# Defaults:
+
+# model2-output for model scoring results
+
+# autotrain-workspace for workspace data.
+
+# Pipeline Resources (dependencies on other pipelines)
+# resources:
+#   pipelines:
+#    - pipeline: m1m2sourcescorebuild
+#      project: "Revenue Prediction"
+#      source: "[Build] M1M2 score image"
+#      trigger:
+#       branches:
+#         include:
+#         - develop
+#         - main
+#         - master
+
+
+# (and similar for m3sourcescorebuild, m4sourcescorebuild, m5sourcescorebuild, and train artifact builds)
+
+# Defines dependent pipelines that must run first.
+
+# Example: m1m2sourcescorebuild is another pipeline in project Revenue Prediction that builds the scoring Docker image.
+
+# This pipeline triggers when those source pipelines run successfully on branches (develop, main, master).
+
+# Variables
+# variables:
+# - group: 'Azure Variables'
+
+
+# Links a variable group (Azure Variables) from the Library (common secrets, tokens, configs).
+
+# - name: scoreTimestamp
+#   value: SetByInitialStage
+
+
+# Initial placeholder for scoring timestamp.
+
+# - name: scoreImageName
+#   value: revenue-prediction-m1-m2-score
+
+
+# Default scoring image name.
+
+# - name: jobName
+#   value: model-scoring
+# - name: jobManifest
+#   value: model-scoring-job.yaml
+
+
+# Job naming convention and manifest filename (the Kubernetes YAML).
+
+# - name: m1m2ScoreImageName
+#   value: rtirevenueprediction.azurecr.io/revenue-prediction-m1-m2
+
+
+# (and similar for m3, m4, m5)
+
+# Defines the base image names from the Azure Container Registry (ACR).
+
+# - name: m1-m2-score-at-main
+#   value: $[or(eq(variables['resources.pipeline.m1m2sourcescorebuild.sourceBranch'], 'refs/heads/main'), eq(variables['resources.pipeline.m1m2sourcescorebuild.sourceBranch'], 'refs/heads/master'))]
+
+
+# (and similar for m3/m4/m5 and train artifacts)
+
+# Checks whether the pipeline resource ran on main or master.
+
+# Produces a boolean-like string (True/False).
+
+# - name: score-at-main
+#   value: $[and(and(and(eq(variables['m1-m2-score-at-main'],'True'), eq(variables['m3-score-at-main'],'True')),eq(variables['m4-score-at-main'],'True')),eq(variables['m5-score-at-main'],'True'))]
+
+
+# Ensures all scoring image builds were from main/master.
+
+# - name: train-artifact-at-main
+#   value: $[and(and(eq(variables['m1-m2-train-artifact-at-main'],'True'), eq(variables['m3-train-artifact-at-main'],'True')),eq(variables['m4-train-artifact-at-main'],'True'))]
+
+
+# Ensures all training artifacts came from main/master.
+
+# - name: all-pipelines-at-main
+#   value: $[and(eq(variables['score-at-main'],'True'), eq(variables['train-artifact-at-main'],'True'))]
+
+
+# Final condition: only if all scoring + training pipelines ran on main/master do we deploy to production.
+
+# Stage: SetTimestamp
+# - stage: SetTimestamp
+#   displayName: Set the Timestamp for the scoring data and Prepare the Yaml
+
+
+# First stage: prepares timestamps and generates a Kubernetes manifest.
+
+#   jobs:  
+#   - job: Prepare
+#     displayName: Prepare
+#     timeoutInMinutes: 300
+#     pool: "msalowgts-devopvmss"
+
+
+# A single job in this stage. Runs on self-hosted pool msalowgts-devopvmss.
+
+#     steps:
+#     - download: m1m2sourcetrainartifactbuild
+#       artifact: devresults
+
+
+# (and for m3/m4)
+
+# Downloads the devresults artifacts (which include TrainTimestamp.txt) from dependent train pipelines.
+
+#     - task: PowerShell@2
+#       script: 'gci env:RESOURCES* | Sort-Object -Property key | format-table -wrap'
+#       displayName: 'Display environment'
+
+
+# Debug step to print out environment variables.
+
+#     - bash: |
+#         find .
+#         train_TIMESTAMP=`cat $(PIPELINE.WORKSPACE)/m1m2sourcetrainartifactbuild/devresults/TrainTimestamp.txt`
+#         echo "##vso[task.setvariable variable=trainTimestamp]${train_TIMESTAMP}" 
+
+
+# (and similar for m3/m4)
+
+# Reads timestamp files from downloaded artifacts.
+
+# Exposes them as pipeline variables (trainTimestamp, m3trainTimestamp, m4trainTimestamp).
+
+#     - bash: |
+#         echo "trainTimestamp is [$(trainTimestamp)]"
+#         ...
+#       displayName: 'Show results of train timestamp'
+
+
+# Prints variable values for debugging.
+
+#     - task: PowerShell@2
+#       script: |
+#          # Replace placeholders in job manifest with actual values
+
+
+# Reads jobManifest YAML template.
+
+# Replaces {TRAIN_TIMESTAMP}, {M3_TRAIN_TIMESTAMP}, {M4_TRAIN_TIMESTAMP} with actual values.
+
+# Also replaces image tags with the exact pipeline run numbers.
+
+# Outputs updated manifest into $(Build.ArtifactStagingDirectory).
+
+#     - publish: '$(Build.ArtifactStagingDirectory)'
+#       artifact: kubernetes
+
+
+# Publishes the final manifest YAML for later stages.
+
+# Stage: Devscore
+# - stage: Devscore
+#   displayName: Dev- Deploy scoring cronjob
+#   dependsOn: SetTimestamp
+
+
+# Deploys scoring cronjob into Dev AKS after manifest is prepared.
+
+#   - deployment: scoring
+#     environment: development
+#     strategy:
+#       runOnce:
+#         deploy:
+#           steps:  
+#           - task: DownloadPipelineArtifact@2
+
+
+# Downloads generated manifest artifact (kubernetes).
+
+# Then calls template deployScoreJobManifest.yml with Dev parameters.
+
+# Deploys into namespace cfo-apps-revpred-dev using Dev SAS token.
+
+# Stage: Prodscore
+# - stage: Prodscore
+#   displayName: Production- Deploy scoring cronjob
+#   dependsOn: Devscore
+#   condition: and(succeeded(), eq(variables['all-pipelines-at-main'],'true'))
+
+
+# Production deploy only happens if Dev succeeded and all pipelines were from main/master.
+
+# Uses Prod AKS service connection, namespace, storage account, and SAS token.
+
+# Also applies manifest via deployScoreJobManifest.yml.
+
+# ✅ Summary:
+# This pipeline automates multi-model scoring deployment into AKS.
+
+# Triggers on scoring/train pipelines and repo changes.
+
+# Collects training timestamps and builds a manifest.
+
+# Deploys to Dev AKS first.
+
+# If all builds came from main/master and Dev succeeded → deploys to Prod AKS.
+

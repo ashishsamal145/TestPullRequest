@@ -1,0 +1,456 @@
+# model-scoring-job.yaml
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: model-scoring-cronjob
+spec:
+  # note that AKS scheduling is by UMT.  below is 6:45 EDT 
+  schedule: "45 10 * * *"
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          name: model-scoring-cronjob
+        spec:
+          restartPolicy: Never
+          volumes:
+          - name: scoring-data
+            persistentVolumeClaim:
+                claimName: model-scoring-pv-claim
+          containers:
+          - name: job-done
+            image: busybox
+            command: ['sh', '-c', 'echo "scoring completed"']
+          dnsPolicy: ClusterFirst
+          restartPolicy: Never
+          initContainers:
+          - name: set-timestamps
+            image: alpine:3.7
+            command: ["/bin/sh", "-c"]
+            args:
+            - mkdir -p /persist/logs;
+              find /persist/logs -type f -mtime +30 -delete;
+              env | grep -i -v key;
+              echo "$(date +"%Y%m%d%H%M")" > /persist/ScoreTimestamp.txt;
+              echo "$TRAIN_TIMESTAMP" > /persist/TrainTimestamp.txt;
+              echo "$M3_TRAIN_TIMESTAMP" > /persist/M3_PipelineTimestamp.txt;
+              echo "$M4_TRAIN_TIMESTAMP" > /persist/M4_PipelineTimestamp.txt;
+            env:
+            # moving this to the config map will prevent parallel runs. so leave it here even though it's common
+            - name: TRAIN_TIMESTAMP
+              #  value: "202308010500"
+              value: "{TRAIN_TIMESTAMP}"
+            - name: M3_TRAIN_TIMESTAMP
+              # value: "202308162057"
+              value: "{M3_TRAIN_TIMESTAMP}"
+            - name: M4_TRAIN_TIMESTAMP
+              # value: "202308162005"
+              value: "{M4_TRAIN_TIMESTAMP}"
+            volumeMounts:
+            - mountPath: /persist
+              name: scoring-data              
+          - name: revenue-prediction-m1-m2-score
+            image: rtirevenueprediction.azurecr.io/revenue-prediction-m1-m2:20230717.1 
+            # memory request forces job/pod to the larger node pool
+            command: ["/bin/sh", "-c"]
+            args:
+            - export SCORE_TIMESTAMP=$( cat /persist/ScoreTimestamp.txt);
+              export TRAIN_TIMESTAMP=$( cat /persist/TrainTimestamp.txt);
+              Rscript --verbose score.r | tee -a /persist/m1-score-${SCORE_TIMESTAMP}.log
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                memory: "8000Mi"
+            env:
+            - name: WORKSPACE
+              value: "azure"
+            # set on each iteration   SCORE_TIMESTAMP=$(cat $(ScoreTimestampFilepath))  
+            - name: AZURE_STORAGE_WORKSPACE_CONTAINER
+              valueFrom:
+                configMapKeyRef:
+                  name: model-scoring-config
+                  key: AZURE_STORAGE_WORKSPACE_CONTAINER               
+            - name: AZURE_STORAGE_OUTPUT_CONTAINER
+              valueFrom:
+                configMapKeyRef:
+                  name: model-scoring-config
+                  key: AZURE_MODEL2_OUTPUT_CONTAINER
+            envFrom:
+            # kubernetes secret loaded from build pipeline
+            - secretRef:
+                name: model-scoring-secret
+            - configMapRef:
+                name: model-scoring-config
+            volumeMounts:
+            - mountPath: /persist
+              name: scoring-data   
+          - name: revenue-prediction-m3-score-backlog
+            image: rtirevenueprediction.azurecr.io/revenue-prediction-m3-score:20230816.2
+            # memory request forces job/pod to the larger node pool
+            command: ["/bin/sh", "-c"]
+            args:
+            - export SCORE_TIMESTAMP=$(cat /persist/ScoreTimestamp.txt);
+              export TRAIN_TIMESTAMP=$(cat /persist/M3_PipelineTimestamp.txt);
+              env;
+              .  ./scripts/score_docker_entrypoint.sh 
+            imagePullPolicy: IfNotPresent
+            resources:
+             requests:
+                 memory: "8000Mi"
+            env:
+            - name: JOB
+              value: "backlog"
+            envFrom:
+            # kubernetes secret loaded from build pipeline
+            - secretRef:
+                name: model-scoring-secret
+            - configMapRef:
+                name: model-scoring-config
+            volumeMounts:
+            - mountPath: /persist
+              name: scoring-data   
+          - name: revenue-prediction-m3-score-opportunities
+            image: rtirevenueprediction.azurecr.io/revenue-prediction-m3-score:20230816.2
+            # memory request forces job/pod to the larger node pool
+            command: ["/bin/sh", "-c"]
+            args:
+            - export SCORE_TIMESTAMP=$(cat /persist/ScoreTimestamp.txt);
+              export TRAIN_TIMESTAMP=$(cat /persist/M3_PipelineTimestamp.txt);
+              env;
+              .  ./scripts/score_docker_entrypoint.sh 
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                memory: "8000Mi"
+            env:
+            - name: JOB
+              value: "opportunities"
+            envFrom:
+            # kubernetes secret loaded from build pipeline
+            - secretRef:
+                name: model-scoring-secret
+            - configMapRef:
+                name: model-scoring-config
+            volumeMounts:
+            - mountPath: /persist
+              name: scoring-data   
+
+          - name: revenue-prediction-m4-score-backlog
+            image: rtirevenueprediction.azurecr.io/revenue-prediction-m4-score:20230816.1
+            # memory request forces job/pod to the larger node pool
+            command: ["/bin/sh", "-c"]
+            args:
+            - export SCORE_TIMESTAMP=$(cat /persist/ScoreTimestamp.txt);
+              export TRAIN_TIMESTAMP=$(cat /persist/M4_PipelineTimestamp.txt);
+              env;
+              .  ./scripts/score_docker_entrypoint.sh 
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                memory: "8000Mi"
+            env:
+            - name: JOB
+              value: "backlog"
+            envFrom:
+            # kubernetes secret loaded from build pipeline
+            - secretRef:
+                name: model-scoring-secret
+            - configMapRef:
+                name: model-scoring-config
+            volumeMounts:
+            - mountPath: /persist
+              name: scoring-data   
+          - name: revenue-prediction-m4-score-opportunities
+            image: rtirevenueprediction.azurecr.io/revenue-prediction-m4-score:20210609.1
+            # memory request forces job/pod to the larger node pool
+            command: ["/bin/sh", "-c"]
+            args:
+            - export SCORE_TIMESTAMP=$(cat /persist/ScoreTimestamp.txt);
+              export TRAIN_TIMESTAMP=$(cat /persist/m4_PipelineTimestamp.txt);
+              env;
+              .  ./scripts/score_docker_entrypoint.sh 
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                memory: "8000Mi"
+            env:
+            - name: JOB
+              value: "opportunities"
+            envFrom:
+            # kubernetes secret loaded from build pipeline
+            - secretRef:
+                 name: model-scoring-secret
+            - configMapRef:
+                 name: model-scoring-config
+            volumeMounts:
+            - mountPath: /persist
+              name: scoring-data  
+              
+          - name: revenue-prediction-m5-score
+            image: rtirevenueprediction.azurecr.io/revenue-prediction-m5:20230817.3
+            # memory request forces job/pod to the larger node pool
+            command: ["/bin/sh", "-c"]
+            args:
+             - export SCORE_TIMESTAMP=$(cat /persist/ScoreTimestamp.txt);
+               export M2_TRAIN_TIMESTAMP=$(cat /persist/TrainTimestamp.txt);
+               export M3_PREPROCESS_TIMESTAMP=$(cat /persist/M3_PipelineTimestamp.txt);
+               env;
+               .  ./scripts/score_docker_entrypoint.sh 
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                memory: "8000Mi"
+            env:
+            - name: JOB
+              value: "backlog"
+            envFrom:
+            # kubernetes secret loaded from build pipeline
+            - secretRef:
+                 name: model-scoring-secret
+            - configMapRef:
+                 name: model-scoring-config
+            volumeMounts:
+            - mountPath: /persist
+              name: scoring-data
+
+# Explanation: ----------------------------------------------------------------------------
+
+# model-scoring-job.yaml line by line in detail so you understand every single part.
+
+# 📌 Header – What is this object?
+# apiVersion: batch/v1
+# kind: CronJob
+# metadata:
+#   name: model-scoring-cronjob
+
+
+# apiVersion: batch/v1 → We’re creating a batch job resource (CronJob) in Kubernetes.
+
+# kind: CronJob → A Kubernetes job that runs on a schedule (like Linux cron).
+
+# metadata.name → Name of the resource: model-scoring-cronjob.
+
+# 📌 Spec – Scheduling & Job Definition
+# spec:
+#   # note that AKS scheduling is by UMT.  below is 6:45 EDT 
+#   schedule: "45 10 * * *"
+
+
+# This runs the job every day at 10:45 UTC (which is 6:45 AM EDT).
+
+# Cron format = minute hour day month weekday.
+
+#   jobTemplate:
+#     spec:
+#       ttlSecondsAfterFinished: 3600
+
+
+# Defines the job template (what to run when scheduled).
+
+# ttlSecondsAfterFinished: 3600 → after the job finishes, Kubernetes cleans up the Job object after 1 hour.
+
+# 📌 Pod Template for Each Job
+#       template:
+#         metadata:
+#           name: model-scoring-cronjob
+
+
+# Pods that run under this job will be named model-scoring-cronjob-xxxxx.
+
+#         spec:
+#           restartPolicy: Never
+
+
+# If a pod fails, it will not restart automatically.
+
+# 📌 Volumes
+#           volumes:
+#           - name: scoring-data
+#             persistentVolumeClaim:
+#                 claimName: model-scoring-pv-claim
+
+
+# Attaches a Persistent Volume Claim (PVC) named model-scoring-pv-claim.
+
+# This is mounted at /persist by containers → used to share logs, timestamps, and data across all scoring containers.
+
+# 📌 Init Container
+#           initContainers:
+#           - name: set-timestamps
+#             image: alpine:3.7
+
+
+# Runs before all scoring containers.
+
+# Uses lightweight Alpine Linux to set up environment.
+
+#             command: ["/bin/sh", "-c"]
+#             args:
+#             - mkdir -p /persist/logs;
+#               find /persist/logs -type f -mtime +30 -delete;
+#               env | grep -i -v key;
+#               echo "$(date +"%Y%m%d%H%M")" > /persist/ScoreTimestamp.txt;
+#               echo "$TRAIN_TIMESTAMP" > /persist/TrainTimestamp.txt;
+#               echo "$M3_TRAIN_TIMESTAMP" > /persist/M3_PipelineTimestamp.txt;
+#               echo "$M4_TRAIN_TIMESTAMP" > /persist/M4_PipelineTimestamp.txt;
+
+
+# What it does:
+
+# Creates /persist/logs folder if missing.
+
+# Deletes old log files (>30 days old).
+
+# Prints environment variables (excluding keys).
+
+# Writes:
+
+# Current timestamp → /persist/ScoreTimestamp.txt
+
+# $TRAIN_TIMESTAMP → /persist/TrainTimestamp.txt
+
+# $M3_TRAIN_TIMESTAMP → /persist/M3_PipelineTimestamp.txt
+
+# $M4_TRAIN_TIMESTAMP → /persist/M4_PipelineTimestamp.txt
+
+# So the init container prepares timestamp files that will be read by scoring containers.
+
+#             env:
+#             - name: TRAIN_TIMESTAMP
+#               value: "{TRAIN_TIMESTAMP}"
+#             - name: M3_TRAIN_TIMESTAMP
+#               value: "{M3_TRAIN_TIMESTAMP}"
+#             - name: M4_TRAIN_TIMESTAMP
+#               value: "{M4_TRAIN_TIMESTAMP}"
+
+
+# These environment variables come from your build pipeline.
+
+# They’re placeholders that get replaced when pipeline injects the values.
+
+#             volumeMounts:
+#             - mountPath: /persist
+#               name: scoring-data
+
+
+# Mounts the PVC to /persist so the init container can write timestamp files into it.
+
+# 📌 Main Job Containers (run in parallel)
+
+# Each container runs a different scoring job, all mounting the same /persist volume.
+
+# 🟢 M1–M2 Scoring
+#           - name: revenue-prediction-m1-m2-score
+#             image: rtirevenueprediction.azurecr.io/revenue-prediction-m1-m2:20230717.1
+
+
+# Runs the M1 & M2 revenue prediction models.
+
+#             command: ["/bin/sh", "-c"]
+#             args:
+#             - export SCORE_TIMESTAMP=$( cat /persist/ScoreTimestamp.txt);
+#               export TRAIN_TIMESTAMP=$( cat /persist/TrainTimestamp.txt);
+#               Rscript --verbose score.r | tee -a /persist/m1-score-${SCORE_TIMESTAMP}.log
+
+
+# Reads timestamps from /persist.
+
+# Runs score.r (R script).
+
+# Logs output to /persist/m1-score-<timestamp>.log.
+
+#             resources:
+#               requests:
+#                 memory: "8000Mi"
+
+
+# Requests 8 GB memory → ensures this runs on a large node.
+
+#             env:
+#             - name: WORKSPACE
+#               value: "azure"
+
+
+# Marks that workspace = Azure.
+
+#             envFrom:
+#             - secretRef:
+#                 name: model-scoring-secret
+#             - configMapRef:
+#                 name: model-scoring-config
+
+
+# Loads sensitive credentials from model-scoring-secret.
+
+# Loads non-sensitive config (like container names, output locations) from model-scoring-config.
+
+#             volumeMounts:
+#             - mountPath: /persist
+#               name: scoring-data
+
+
+# Mounts PVC to /persist.
+
+# 🟢 M3 Scoring (Backlog + Opportunities)
+#           - name: revenue-prediction-m3-score-backlog
+#           - name: revenue-prediction-m3-score-opportunities
+
+
+# Two containers, both use rtirevenueprediction.azurecr.io/revenue-prediction-m3-score.
+
+# One runs with JOB=backlog, the other with JOB=opportunities.
+
+# Each exports SCORE_TIMESTAMP & M3_PipelineTimestamp, then runs:
+
+# . ./scripts/score_docker_entrypoint.sh
+
+
+# The entrypoint script executes model scoring logic.
+
+# 🟢 M4 Scoring (Backlog + Opportunities)
+#           - name: revenue-prediction-m4-score-backlog
+#           - name: revenue-prediction-m4-score-opportunities
+
+
+# Similar to M3, but runs M4 model scoring.
+
+# Reads timestamps from /persist/M4_PipelineTimestamp.txt.
+
+# One backlog job, one opportunities job.
+
+# 🟢 M5 Scoring
+#           - name: revenue-prediction-m5-score
+#             image: rtirevenueprediction.azurecr.io/revenue-prediction-m5:20230817.3
+
+
+# Runs M5 model scoring.
+
+#             args:
+#              - export SCORE_TIMESTAMP=$(cat /persist/ScoreTimestamp.txt);
+#                export M2_TRAIN_TIMESTAMP=$(cat /persist/TrainTimestamp.txt);
+#                export M3_PREPROCESS_TIMESTAMP=$(cat /persist/M3_PipelineTimestamp.txt);
+#                .  ./scripts/score_docker_entrypoint.sh
+
+
+# Uses multiple timestamps (from M2 & M3 as well).
+
+# Runs the model’s scoring script.
+
+# ✅ End Result
+
+# Init container prepares logs + timestamp files in /persist.
+
+# Scoring containers (M1 → M5) run in parallel, each processing a model’s scoring task.
+
+# Logs + outputs are written to shared volume /persist.
+
+# Secrets & configs are pulled from Kubernetes objects.
+
+# Job runs every morning at 6:45 AM EDT.
+
+# Completed job objects are cleaned after 1 hour.
+
+# ⚡ In plain English:
+# This YAML defines a daily scheduled ML scoring pipeline on AKS where multiple containers (M1–M5) run in parallel, using shared timestamps and persistent volume storage, with automatic cleanup and log rotation.

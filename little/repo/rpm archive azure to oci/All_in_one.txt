@@ -1,0 +1,397 @@
+# azure-to-oci-daily-extract.yaml
+
+trigger: none
+pool: "msalowgts-devopvmss"
+pr: none
+schedules:
+- cron: "0 12 * * *"
+  displayName: Daily at 7am (UTC)
+  branches:
+    include:
+    - master
+  always: true
+
+parameters:
+- name: logFrequency
+  type: string
+  default: '100'
+
+# Azure
+- name: azureStorageAccount
+  type: string
+  default: 'mystorageacct'
+- name: azureBlobPrefix
+  type: string
+  default: ''
+- name: azureSasToken
+  type: string
+  default: $(AZURE_CONTAINER_SAS)
+
+# OCI
+- name: ociRegion
+  type: string
+  default: 'us-ashburn-1'
+- name: ociNamespace
+  type: string
+  default: 'idr67sb5tyab'
+- name: ociOutBucket
+  type: string
+  default: 'revpred-archive-uat'
+
+# Working dirs
+- name: downloadDirectory
+  type: string
+  default: 'download/'
+- name: uploadDirectory
+  type: string
+  default: 'upload/'
+
+# OCI Secure Files
+- name: ociCliDestConfigEnv
+  type: string
+  default: $(ociApiConfigDest.secureFilePath)
+- name: ociApiKeyDestEnv
+  type: string
+  default: $(ociApiKeyDest.secureFilePath)
+
+variables:
+  OCI_CLI_HOME: '/home/AzDevOps/.oci'
+  OCI_CLI_BIN: '/home/AzDevOps/bin'
+
+stages:
+- stage: azure_to_oci
+  jobs:
+  - job: run_transfer
+    timeoutInMinutes: 600
+    steps:
+    - task: DownloadSecureFile@1
+      name: ociApiConfigDest
+      inputs:
+        secureFile: 'devops_oci_DEST_api_config_file.txt'
+
+    - task: DownloadSecureFile@1
+      name: ociApiKeyDest
+      inputs:
+        secureFile: 'devops_oci_DEST_api_key.pem'
+
+    - task: Bash@3
+      displayName: Install Azure & OCI CLI
+      inputs:
+        targetType: inline
+        script: |
+          if ! command -v az >/dev/null 2>&1; then
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+          if [ ! -f "$OCI_CLI_BIN/oci" ]; then
+            bash -c "$(curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)" -- --accept-all-defaults
+          fi
+          mkdir -p $OCI_CLI_HOME
+          cp -f ${{ parameters.ociCliDestConfigEnv }} $OCI_CLI_HOME/config
+          cp -f $(ociApiKeyDest.secureFilePath) $OCI_CLI_HOME/oci_api_key.pem
+          $OCI_CLI_BIN/oci setup repair-file-permissions --file $OCI_CLI_HOME/config
+          $OCI_CLI_BIN/oci setup repair-file-permissions --file $OCI_CLI_HOME/oci_api_key.pem
+          echo "##vso[task.prependpath]$OCI_CLI_BIN"
+
+    - task: PowerShell@2
+      displayName: Run Transfer Script
+      inputs:
+        targetType: filePath
+        filePath: transfer.ps1
+        arguments: >
+          -azureStorageAccount "${{ parameters.azureStorageAccount }}"
+          -azureBlobPrefix "${{ parameters.azureBlobPrefix }}"
+          -azureSasToken "${{ parameters.azureSasToken }}"
+          -ociRegion "${{ parameters.ociRegion }}"
+          -ociNamespace "${{ parameters.ociNamespace }}"
+          -ociOutBucket "${{ parameters.ociOutBucket }}"
+          -downloadDirectory "${{ parameters.downloadDirectory }}"
+          -uploadDirectory "${{ parameters.uploadDirectory }}"
+          -logFrequency "${{ parameters.logFrequency }}"
+
+=========================================================================================================================================================
+
+transfer.ps1
+
+param(
+    [string]$azureStorageAccount,
+    [string]$azureSasToken,
+    [string]$azureBlobPrefix,
+    [string]$ociRegion,
+    [string]$ociNamespace,
+    [string]$ociOutBucket,
+    [string]$downloadDirectory,
+    [string]$uploadDirectory,
+    [int]$logFrequency = 100
+)
+
+# ---------------------------
+# Helper: Reset working directory
+# ---------------------------
+function Reset-Directory($path) {
+    if (Test-Path $path) { Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Force -Path $path | Out-Null
+}
+
+# ---------------------------
+# Setup
+# ---------------------------
+Import-Module Az.Storage -Force -ErrorAction Stop
+
+Reset-Directory $downloadDirectory
+Reset-Directory $uploadDirectory
+
+$context     = New-AzStorageContext -StorageAccountName $azureStorageAccount -SasToken $azureSasToken
+$cutoff  = [DateTime]::Now.AddDays(-1)
+$counter = 0
+
+# ---------------------------
+# Process containers & blobs
+# ---------------------------
+$containers = Get-AzStorageContainer -Context $context
+Write-Host "Found $($containers.Count) containers in storage account: $azureStorageAccount"
+
+foreach ($container in $containers) {
+    Write-Host "`n--- Container: $($container.Name) ---"
+
+    $blobs = Get-AzStorageBlob -Container $container.Name -Context $context |
+             Where-Object { $_.Name -like "$azureBlobPrefix*" -and $_.LastModified -gt $cutoff }
+
+    Write-Host "  -> Eligible blobs: $($blobs.Count)"
+
+    foreach ($blob in $blobs) {
+        $counter++
+        $fileName     = $blob.Name
+        $downloadPath = Join-Path $downloadDirectory $fileName
+        $uploadPath   = Join-Path $uploadDirectory $fileName
+
+        Write-Host "[$counter] Processing blob: $fileName"
+
+        # Reset dirs each iteration
+        Reset-Directory $downloadDirectory
+        Reset-Directory $uploadDirectory
+
+        # Ensure parent dirs exist
+        New-Item -ItemType Directory -Force -Path (Split-Path $downloadPath) | Out-Null
+        New-Item -ItemType Directory -Force -Path (Split-Path $uploadPath)   | Out-Null
+
+        # Download from Azure
+        Get-AzStorageBlobContent -Container $container.Name -Blob $fileName -Destination $downloadPath -Context $context -Force | Out-Null
+
+        # Copy into upload dir
+        Copy-Item $downloadPath $uploadPath -Force
+
+        # Upload to OCI
+        oci os object put `
+          --region $ociRegion `
+          --namespace $ociNamespace `
+          --bucket-name $ociOutBucket `
+          --file $uploadPath `
+          --name $fileName `
+          --force | Out-Null
+
+        if ($counter % $logFrequency -eq 0) {
+            Write-Host "Processed $counter files so far..."
+        }
+    }
+}
+
+Write-Host "`n✅ Transfer completed. Total blobs processed: $counter"
+
+=====================================================================================================================================================
+
+🔹 Parameter Declaration
+param(
+    [string]$azureStorageAccount,
+    [string]$azureSasToken,
+    [string]$azureBlobPrefix,
+    [string]$ociRegion,
+    [string]$ociNamespace,
+    [string]$ociOutBucket,
+    [string]$downloadDirectory,
+    [string]$uploadDirectory,
+    [int]$logFrequency = 100
+)
+
+
+Declares input parameters for the script.
+
+$azureStorageAccount → Name of the Azure Storage Account.
+
+$azureSasToken → SAS token (authentication) for that account.
+
+$azureBlobPrefix → Optional filter (like folder path) to only include blobs with this prefix.
+
+$ociRegion, $ociNamespace, $ociOutBucket → Info needed for OCI object storage upload.
+
+$downloadDirectory → Local directory where blobs are downloaded.
+
+$uploadDirectory → Local directory where blobs are staged for OCI upload.
+
+$logFrequency → After every N files, print progress (default = 100).
+
+🔹 Helper Function
+function Reset-Directory($path) {
+    if (Test-Path $path) { Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Force -Path $path | Out-Null
+}
+
+
+Deletes a directory if it exists, then recreates it.
+
+Ensures every iteration starts with a clean working directory.
+
+Example: if $downloadDirectory has leftover files, they are wiped before use.
+
+🔹 Setup
+Import-Module Az.Storage -Force -ErrorAction Stop
+
+
+Loads Azure PowerShell storage module (required for blob operations).
+
+Reset-Directory $downloadDirectory
+Reset-Directory $uploadDirectory
+
+
+Cleans and recreates working directories before script starts.
+
+$context     = New-AzStorageContext -StorageAccountName $azureStorageAccount -SasToken $azureSasToken
+
+
+Creates an Azure Storage context using account name + SAS token (used for authentication).
+
+$cutoff  = [DateTime]::Now.AddDays(-1)
+
+
+Defines cutoff = 24 hours ago. Only blobs modified after this timestamp will be processed.
+
+$counter = 0
+
+
+Counter to keep track of how many blobs have been processed.
+
+🔹 Process Containers & Blobs
+$containers = Get-AzStorageContainer -Context $context
+Write-Host "Found $($containers.Count) containers in storage account: $azureStorageAccount"
+
+
+Retrieves all containers in the storage account.
+
+Prints how many containers were found.
+
+Loop through containers
+foreach ($container in $containers) {
+    Write-Host "`n--- Container: $($container.Name) ---"
+
+
+Iterates over each container in the storage account.
+
+Find blobs with prefix + cutoff filter
+    $blobs = Get-AzStorageBlob -Container $container.Name -Context $context |
+             Where-Object { $_.Name -like "$azureBlobPrefix*" -and $_.LastModified -gt $cutoff }
+
+
+Gets all blobs in the container.
+
+Filters:
+
+Blob name starts with $azureBlobPrefix.
+
+Last modified time is newer than $cutoff (last 24h).
+
+    Write-Host "  -> Eligible blobs: $($blobs.Count)"
+
+
+Prints how many blobs matched the filter.
+
+Process each blob
+    foreach ($blob in $blobs) {
+        $counter++
+        $fileName     = $blob.Name
+        $downloadPath = Join-Path $downloadDirectory $fileName
+        $uploadPath   = Join-Path $uploadDirectory $fileName
+
+
+Increment file counter.
+
+Save blob name into $fileName.
+
+Build full paths for downloading & staging upload.
+
+        Write-Host "[$counter] Processing blob: $fileName"
+
+
+Prints progress (which blob is being handled).
+
+Reset working dirs for each iteration
+        Reset-Directory $downloadDirectory
+        Reset-Directory $uploadDirectory
+
+
+Clears download/ and upload/ before processing each blob.
+
+Ensures no leftover files cause confusion.
+
+Ensure parent directories exist
+        New-Item -ItemType Directory -Force -Path (Split-Path $downloadPath) | Out-Null
+        New-Item -ItemType Directory -Force -Path (Split-Path $uploadPath)   | Out-Null
+
+
+Makes sure directories for the blob file exist.
+
+Handles blobs stored in "virtual folders" (like folder1/file.txt).
+
+Download blob from Azure
+        Get-AzStorageBlobContent -Container $container.Name -Blob $fileName -Destination $downloadPath -Context $context -Force | Out-Null
+
+
+Downloads the blob into $downloadPath.
+
+Copy into upload directory
+        Copy-Item $downloadPath $uploadPath -Force
+
+
+Copies the file into $uploadDirectory.
+
+Prepares a clean file for uploading to OCI.
+
+Upload to OCI
+        oci os object put `
+          --region $ociRegion `
+          --namespace $ociNamespace `
+          --bucket-name $ociOutBucket `
+          --file $uploadPath `
+          --name $fileName `
+          --force | Out-Null
+
+
+Calls OCI CLI to upload the file.
+
+Arguments:
+
+--region → target OCI region.
+
+--namespace → OCI namespace.
+
+--bucket-name → destination bucket.
+
+--file → path to local file.
+
+--name → blob name (same as Azure blob).
+
+--force → overwrite if exists.
+
+Log progress
+        if ($counter % $logFrequency -eq 0) {
+            Write-Host "Processed $counter files so far..."
+        }
+
+
+Every $logFrequency files, print a progress message.
+
+Example: If $logFrequency = 100, it logs every 100 files.
+
+✅ Summary:
+This script → loops over all Azure containers, filters blobs by prefix & last modified, downloads each blob, resets directories, copies file, then uploads to OCI bucket.
+
+
+

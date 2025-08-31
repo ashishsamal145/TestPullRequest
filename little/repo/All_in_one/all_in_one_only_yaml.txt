@@ -1,0 +1,2717 @@
+pipeline%20scripts
+    │   azure-daily-storage-container-test.yml
+    │   cleanup-images-azure-pipelines.yml
+    │   consolidated_aks_scoring_deployment.yml
+    │   daily-extract-azure-pipeline.yml
+    │   dev.create-excel-files.sh
+    │   m3-training-pipeline-azure.yml
+    │   m4-training-pipeline-azure.yaml
+    │   prod.create-excel-files.sh
+    │   README.md
+    │   RPMStorageDailyPesterTests.ps1
+    │   training-pipeline-azure.yml
+    │
+    ├───.vs
+    │       slnx.sqlite
+    │
+    ├───deployment
+    │   └───kubernetes
+    │       │   azure-pvc.yaml
+    │       │   m3-model-training-job.yaml
+    │       │   m4-model-training-job.yaml
+    │       │   model-scoring-job.yaml
+    │       │   model-scoring-pvc.yaml
+    │       │   model-training-job.yaml
+    │       │
+    │       └───web
+    │               redis-deployment.yaml
+    │               web-deployment.yaml
+    │
+    └───pipeline-templates
+            deployScorejobmaifests.yaml
+            deployscoreJobManifest.yml
+            deployTrainJobManifest.yml
+            updateInstalls.yml
+
+
+azure-pvc.yaml → training-pipeline-azure.yml, line 118
+
+m3-model-training-job.yaml → m3-training-pipeline-azure.yml, line 109
+
+m4-model-training-job.yaml → m4-training-pipeline-azure.yaml, line 109
+
+model-scoring-job.yaml → consolidated_aks_scoring_deployment.yml, line 144
+
+model-scoring-pvc.yaml → consolidated_aks_scoring_deployment.yml, line 132
+
+model-training-job.yaml → training-pipeline-azure.yml, line 131
+
+redis-deployment.yaml → consolidated_aks_scoring_deployment.yml, line 119
+
+web-deployment.yaml → consolidated_aks_scoring_deployment.yml, line 107
+
+===========================================================================================================================================================================================
+
+# redis-deployment.yaml
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-azure-managed-disk
+spec:
+  accessModes:
+  # Many allows new pod to come into service before old pod stops for patching
+  - ReadWriteMany
+  storageClassName: managed-premium
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: revpred-cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: revpred-cache
+  template:
+    metadata:
+      labels:
+        app: revpred-cache
+    spec:
+      nodeSelector:
+        "beta.kubernetes.io/os": linux
+      containers:
+      - name: revpred-cache
+        image: redis:alpine
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 256Mi
+        ports:
+        - containerPort: 6379
+          name: redis
+        volumeMounts:
+        - mountPath: "/data"
+          name: redis-volume
+      volumes:
+        - name: redis-volume
+          persistentVolumeClaim:
+            claimName: redis-azure-managed-disk
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: revpred-cache
+spec:
+  ports:
+  - port: 6379
+  selector:
+    app: revpred-cache
+
+
+===========================================================================================================================================================================================
+
+# web-deployment.yaml
+
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: revpred-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: revpred-web
+  template:
+    metadata:
+      labels:
+        app: revpred-web
+    spec:
+      nodeSelector:
+        "beta.kubernetes.io/os": linux
+      containers:
+      - name: revpred-web
+        # replace latest to selected build for deployment (option in devops kubernetes manifest task)
+        image: rtirevenueprediction.azurecr.io/revenue-prediction:latest
+        # change args for spin & wait forever
+        # command: [ "sh", "-c", "--" ]
+        # args: [ "while true; do sleep 30; done;" ]
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 512Mi
+        ports:
+        - containerPort: 3000
+        imagePullPolicy: Always
+        envFrom:
+        - secretRef:
+            name: revenueprediction-web-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: revpred-web
+  annotations:
+    service.beta.kubernetes.io/azure-dns-label-name: revpred-web-aks
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+spec:
+  ports:
+  - port: 3000
+  selector:
+    app: revpred-web
+  type: LoadBalancer
+  # replace {webStaticIp} in manifest task
+  # static, so it can be routed to from the F5
+  # prod should be 10.196.103.248
+  # dev should be 10.196.103.249
+  loadBalancerIP: {webStaticIp}
+
+
+
+===========================================================================================================================================================================================
+
+#azure-pvc.yaml
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-training-pv-claim
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: azurefile
+  resources:
+    requests:
+      storage: 512Mi
+
+
+===========================================================================================================================================================================================
+
+# m3-model-training-job.yaml
+
+apiVersion: batch/v1
+kind: Job
+# kind: CronJob
+metadata:
+        name: m3-model-training-sequenced-job-{TRAIN_TIMESTAMP}
+spec:
+#       uncomment if cronjob
+#        schedule: "*/1 * * * *"
+#        concurrencyPolicy: Forbid 
+
+        ttlSecondsAfterFinished: 3600  # logs are in devops - no reason to keep the job after completion
+        template:
+          metadata:
+            name: model-training-sequenced-job-{TRAIN_TIMESTAMP}
+          spec:
+      # would be nice to have 
+      #      securityContext:
+      #        runAsUser: 1001
+      #        fsGroup: 1001 
+            initContainers:
+            - name: revenue-prediction-m1-m2-train
+              image: rtirevenueprediction.azurecr.io/revenue-prediction-m3-train:latest
+              # memory request forces job/pod to the larger node pool
+              imagePullPolicy: IfNotPresent
+              resources:
+                requests:
+                  memory: "8000Mi"
+              env:
+              # moving this to the config map will prevent parallel runs. so leave it here even though it's common
+              - name: TIMESTAMP
+                value: "{TRAIN_TIMESTAMP}"
+              - name: READ
+                value: "azure"
+              - name: WRITE
+                value: "azure"
+              - name: BYPASS_DOTENV
+                value: "1"
+              envFrom:
+              # kubernetes secret loaded from build pipeline
+              - secretRef:
+                  name: m3-model-training-secret
+              - configMapRef:
+                  name: m3-model-training-config
+            containers:
+            - name: job-done
+              image: busybox
+              command: ['sh', '-c', 'echo "training completed"']
+            dnsPolicy: ClusterFirst
+            restartPolicy: Never
+
+
+===========================================================================================================================================================================================
+
+# m4-model-training-job.yaml
+
+apiVersion: batch/v1
+kind: Job
+# kind: CronJob
+metadata:
+        name: m4-model-training-sequenced-job-{TRAIN_TIMESTAMP}
+spec:
+#       uncomment if cronjob
+#        schedule: "*/1 * * * *"
+#        concurrencyPolicy: Forbid 
+
+        ttlSecondsAfterFinished: 3600  # logs are in devops - no reason to keep the job after completion
+        template:
+          metadata:
+            name: model-training-sequenced-job-{TRAIN_TIMESTAMP}
+          spec:
+      # would be nice to have 
+      #      securityContext:
+      #        runAsUser: 1001
+      #        fsGroup: 1001 
+            initContainers:
+            - name: revenue-prediction-m1-m2-train
+              image: rtirevenueprediction.azurecr.io/revenue-prediction-m4-train:latest
+              # memory request forces job/pod to the larger node pool
+              imagePullPolicy: IfNotPresent
+              resources:
+                requests:
+                  memory: "8000Mi"
+              env:
+              # moving this to the config map will prevent parallel runs. so leave it here even though it's common
+              - name: TIMESTAMP
+                value: "{TRAIN_TIMESTAMP}"
+              - name: READ
+                value: "azure"
+              - name: WRITE
+                value: "azure"
+              - name: BYPASS_DOTENV
+                value: "1"
+              envFrom:
+              # kubernetes secret loaded from build pipeline
+              - secretRef:
+                  name: m4-model-training-secret
+              - configMapRef:
+                  name: m4-model-training-config
+            containers:
+            - name: job-done
+              image: busybox
+              command: ['sh', '-c', 'echo "training completed"']
+            dnsPolicy: ClusterFirst
+            restartPolicy: Never
+
+
+
+===========================================================================================================================================================================================
+
+# model-scoring-job.yaml
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: model-scoring-cronjob
+spec:
+  # note that AKS scheduling is by UMT.  below is 6:45 EDT 
+  schedule: "45 10 * * *"
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          name: model-scoring-cronjob
+        spec:
+          restartPolicy: Never
+          volumes:
+          - name: scoring-data
+            persistentVolumeClaim:
+                claimName: model-scoring-pv-claim
+          containers:
+          - name: job-done
+            image: busybox
+            command: ['sh', '-c', 'echo "scoring completed"']
+          dnsPolicy: ClusterFirst
+          restartPolicy: Never
+          initContainers:
+          - name: set-timestamps
+            image: alpine:3.7
+            command: ["/bin/sh", "-c"]
+            args:
+            - mkdir -p /persist/logs;
+              find /persist/logs -type f -mtime +30 -delete;
+              env | grep -i -v key;
+              echo "$(date +"%Y%m%d%H%M")" > /persist/ScoreTimestamp.txt;
+              echo "$TRAIN_TIMESTAMP" > /persist/TrainTimestamp.txt;
+              echo "$M3_TRAIN_TIMESTAMP" > /persist/M3_PipelineTimestamp.txt;
+              echo "$M4_TRAIN_TIMESTAMP" > /persist/M4_PipelineTimestamp.txt;
+            env:
+            # moving this to the config map will prevent parallel runs. so leave it here even though it's common
+            - name: TRAIN_TIMESTAMP
+              #  value: "202308010500"
+              value: "{TRAIN_TIMESTAMP}"
+            - name: M3_TRAIN_TIMESTAMP
+              # value: "202308162057"
+              value: "{M3_TRAIN_TIMESTAMP}"
+            - name: M4_TRAIN_TIMESTAMP
+              # value: "202308162005"
+              value: "{M4_TRAIN_TIMESTAMP}"
+            volumeMounts:
+            - mountPath: /persist
+              name: scoring-data              
+          - name: revenue-prediction-m1-m2-score
+            image: rtirevenueprediction.azurecr.io/revenue-prediction-m1-m2:20230717.1 
+            # memory request forces job/pod to the larger node pool
+            command: ["/bin/sh", "-c"]
+            args:
+            - export SCORE_TIMESTAMP=$( cat /persist/ScoreTimestamp.txt);
+              export TRAIN_TIMESTAMP=$( cat /persist/TrainTimestamp.txt);
+              Rscript --verbose score.r | tee -a /persist/m1-score-${SCORE_TIMESTAMP}.log
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                memory: "8000Mi"
+            env:
+            - name: WORKSPACE
+              value: "azure"
+            # set on each iteration   SCORE_TIMESTAMP=$(cat $(ScoreTimestampFilepath))  
+            - name: AZURE_STORAGE_WORKSPACE_CONTAINER
+              valueFrom:
+                configMapKeyRef:
+                  name: model-scoring-config
+                  key: AZURE_STORAGE_WORKSPACE_CONTAINER               
+            - name: AZURE_STORAGE_OUTPUT_CONTAINER
+              valueFrom:
+                configMapKeyRef:
+                  name: model-scoring-config
+                  key: AZURE_MODEL2_OUTPUT_CONTAINER
+            envFrom:
+            # kubernetes secret loaded from build pipeline
+            - secretRef:
+                name: model-scoring-secret
+            - configMapRef:
+                name: model-scoring-config
+            volumeMounts:
+            - mountPath: /persist
+              name: scoring-data   
+          - name: revenue-prediction-m3-score-backlog
+            image: rtirevenueprediction.azurecr.io/revenue-prediction-m3-score:20230816.2
+            # memory request forces job/pod to the larger node pool
+            command: ["/bin/sh", "-c"]
+            args:
+            - export SCORE_TIMESTAMP=$(cat /persist/ScoreTimestamp.txt);
+              export TRAIN_TIMESTAMP=$(cat /persist/M3_PipelineTimestamp.txt);
+              env;
+              .  ./scripts/score_docker_entrypoint.sh 
+            imagePullPolicy: IfNotPresent
+            resources:
+             requests:
+                 memory: "8000Mi"
+            env:
+            - name: JOB
+              value: "backlog"
+            envFrom:
+            # kubernetes secret loaded from build pipeline
+            - secretRef:
+                name: model-scoring-secret
+            - configMapRef:
+                name: model-scoring-config
+            volumeMounts:
+            - mountPath: /persist
+              name: scoring-data   
+          - name: revenue-prediction-m3-score-opportunities
+            image: rtirevenueprediction.azurecr.io/revenue-prediction-m3-score:20230816.2
+            # memory request forces job/pod to the larger node pool
+            command: ["/bin/sh", "-c"]
+            args:
+            - export SCORE_TIMESTAMP=$(cat /persist/ScoreTimestamp.txt);
+              export TRAIN_TIMESTAMP=$(cat /persist/M3_PipelineTimestamp.txt);
+              env;
+              .  ./scripts/score_docker_entrypoint.sh 
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                memory: "8000Mi"
+            env:
+            - name: JOB
+              value: "opportunities"
+            envFrom:
+            # kubernetes secret loaded from build pipeline
+            - secretRef:
+                name: model-scoring-secret
+            - configMapRef:
+                name: model-scoring-config
+            volumeMounts:
+            - mountPath: /persist
+              name: scoring-data   
+
+          - name: revenue-prediction-m4-score-backlog
+            image: rtirevenueprediction.azurecr.io/revenue-prediction-m4-score:20230816.1
+            # memory request forces job/pod to the larger node pool
+            command: ["/bin/sh", "-c"]
+            args:
+            - export SCORE_TIMESTAMP=$(cat /persist/ScoreTimestamp.txt);
+              export TRAIN_TIMESTAMP=$(cat /persist/M4_PipelineTimestamp.txt);
+              env;
+              .  ./scripts/score_docker_entrypoint.sh 
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                memory: "8000Mi"
+            env:
+            - name: JOB
+              value: "backlog"
+            envFrom:
+            # kubernetes secret loaded from build pipeline
+            - secretRef:
+                name: model-scoring-secret
+            - configMapRef:
+                name: model-scoring-config
+            volumeMounts:
+            - mountPath: /persist
+              name: scoring-data   
+          - name: revenue-prediction-m4-score-opportunities
+            image: rtirevenueprediction.azurecr.io/revenue-prediction-m4-score:20210609.1
+            # memory request forces job/pod to the larger node pool
+            command: ["/bin/sh", "-c"]
+            args:
+            - export SCORE_TIMESTAMP=$(cat /persist/ScoreTimestamp.txt);
+              export TRAIN_TIMESTAMP=$(cat /persist/m4_PipelineTimestamp.txt);
+              env;
+              .  ./scripts/score_docker_entrypoint.sh 
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                memory: "8000Mi"
+            env:
+            - name: JOB
+              value: "opportunities"
+            envFrom:
+            # kubernetes secret loaded from build pipeline
+            - secretRef:
+                 name: model-scoring-secret
+            - configMapRef:
+                 name: model-scoring-config
+            volumeMounts:
+            - mountPath: /persist
+              name: scoring-data  
+              
+          - name: revenue-prediction-m5-score
+            image: rtirevenueprediction.azurecr.io/revenue-prediction-m5:20230817.3
+            # memory request forces job/pod to the larger node pool
+            command: ["/bin/sh", "-c"]
+            args:
+             - export SCORE_TIMESTAMP=$(cat /persist/ScoreTimestamp.txt);
+               export M2_TRAIN_TIMESTAMP=$(cat /persist/TrainTimestamp.txt);
+               export M3_PREPROCESS_TIMESTAMP=$(cat /persist/M3_PipelineTimestamp.txt);
+               env;
+               .  ./scripts/score_docker_entrypoint.sh 
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                memory: "8000Mi"
+            env:
+            - name: JOB
+              value: "backlog"
+            envFrom:
+            # kubernetes secret loaded from build pipeline
+            - secretRef:
+                 name: model-scoring-secret
+            - configMapRef:
+                 name: model-scoring-config
+            volumeMounts:
+            - mountPath: /persist
+              name: scoring-data 
+
+
+===========================================================================================================================================================================================
+
+# model-scoring-pvc.yaml
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-scoring-pv-claim
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: azurefile
+  resources:
+    requests:
+      storage: 512Mi
+
+===========================================================================================================================================================================================
+
+# model-training-job.yaml
+
+apiVersion: batch/v1
+kind: Job
+# kind: CronJob
+metadata:
+        name: model-training-sequenced-job-{TRAIN_TIMESTAMP}
+spec:
+#       uncomment if cronjob
+#        schedule: "*/1 * * * *"
+#        concurrencyPolicy: Forbid 
+
+        ttlSecondsAfterFinished: 3600  # logs are in devops - no reason to keep the job after completion
+        template:
+          metadata:
+            name: model-training-sequenced-job-{TRAIN_TIMESTAMP}
+          spec:
+      # would be nice to have - but tidyverse will need a sudoers file drawn up to use this
+      #      securityContext:
+      #        runAsUser: 1001
+      #        fsGroup: 1001 
+      # these tolerations and node selector will force job to run on gpu-capable pool
+            tolerations:
+            - key: sku
+              operator: Equal
+              value: gpu
+              effect: NoSchedule
+            nodeSelector:
+              agentpool: gpunp
+            initContainers:
+            - name: revenue-prediction-m1-m2-train
+              image: rtirevenueprediction.azurecr.io/revenue-prediction-m1-m2-train:latest
+              # memory request forces job/pod to the larger node pool
+              command: ["/bin/sh"]
+              args: ["-c", "env | grep -i -v key; echo '{TRAIN_TIMESTAMP}' > ./TrainTimestamp.txt;Rscript --verbose train.r"]
+              imagePullPolicy: IfNotPresent
+              resources:
+                requests:
+                  memory: "8000Mi"
+              env:
+              # moving this to the config map will prevent parallel runs. so leave it here even though it's common
+              - name: TRAIN_TIMESTAMP
+                value: "{TRAIN_TIMESTAMP}"
+              - name: AZURE_STORAGE_OUTPUT_CONTAINER
+                valueFrom:
+                  configMapKeyRef:
+                    name: model-training-config
+                    key: AZURE_MODEL2_OUTPUT_CONTAINER
+              envFrom:
+              # kubernetes secret loaded from build pipeline
+              - secretRef:
+                  name: model-training-secret
+              - configMapRef:
+                  name: model-training-config
+            containers:
+            - name: job-done
+              image: busybox
+              command: ['sh', '-c', 'echo "training completed"']
+            dnsPolicy: ClusterFirst
+            restartPolicy: Never
+
+
+
+===========================================================================================================================================================================================
+
+# deployScorejobmaifests.yaml
+
+# job variables from pipeline
+#        $(jobName)
+#        $(jobManifest)
+#        input build pipelines
+
+parameters:
+  DEPLOYMENT_SERVICE_CONNECTION: 'NOT_DEFINE'
+  NAMESPACE: 'NOT_DEFINE'
+  AZURE_STORAGE_ACCOUNT: 'NOT_DEFINE'
+  AZURE_STORAGE_ACCOUNT_SAS_TOKEN: 'NOT_DEFINE'
+  ARTIFACT_NAME: 'NOT_DEFINE'
+  AZURE_MODEL2_OUTPUT_CONTAINER: 'NOT_DEFINE'
+  AZURE_STORAGE_WORKSPACE_CONTAINER: 'NOT_DEFINE'
+
+steps:  
+          - template: updateInstalls.yml  # Template reference
+
+          - task: AzureCLI@2
+            displayName: Get storage account name
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}' 
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              addSpnToEnvironment: true
+              inlineScript: |
+
+                 gci -recurse * | select directory, name
+
+                 gci env: |  where Name -notmatch token | format-table -wrap
+                 
+                 $storageAccounts=(az resource list -o json | convertfrom-json) | where type -eq "Microsoft.Storage/storageAccounts"
+                 $storageAccounts | format-table
+                 $AzureStorageAccount='${{parameters.AZURE_STORAGE_ACCOUNT}}'
+                 # if a specific storage account was not specified, take the storage account from the service connection
+                 if ($AzureStorageAccount -eq 'NOT_DEFINE') {
+                    $AzureStorageAccount = ($storageAccounts | select -First 1).name                   
+                    }
+                 Write-Host "##vso[task.setvariable variable=AzureStorageAccount;]$AzureStorageAccount"
+                 Write-host "using storage account $AzureStorageAccount"
+            
+          - task: PowerShell@2
+            displayName: 'Check Environment variables'
+            inputs:
+                targetType: 'inline'
+                script: |
+                  # Write your PowerShell commands here.
+                      
+                  gci env: | format-table -wrap
+                  gci  -recurse | select fullname
+          
+          - task: AzureCLI@2
+            displayName: Get aks cluster name
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              addSpnToEnvironment: true
+              inlineScript: |
+                # we arent using az aks list anymore as it's not working consistently in all environments
+                $resources = az resource list -o json | convertfrom-json       
+                $aksList = $resources | where 'type' -eq 'Microsoft.ContainerService/managedClusters'
+                $aksList | format-table
+                $aksName='$(aksName)'
+                $aksResourceGroup='$(aksResourceGroup)'
+                # use specific aks is named, otherwise derive from service connection permissions
+                if (('set in script' -eq $aksResourceGroup) -or ('set in script' -eq $aksName))
+                {
+                  write-host "Setting aks from service connection environment"
+                  $aksName = ($aksList | select -First 1).name
+                  $aksResourceGroup= ($aksList | select -First 1).resourceGroup
+                }
+                Write-host "using aks $aksName resource group $aksResourceGroup "
+                Write-Host "##vso[task.setvariable variable=aksName;]$aksName"
+                Write-Host "##vso[task.setvariable variable=aksResourceGroup;]$aksResourceGroup"  
+          
+          - task: AzureCLI@2
+            displayName: use kubelogin to connect
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+
+                Write-host "using aks $(aksName) resource group $(aksResourceGroup)"
+                rm -f ".kube/config" &&  az aks get-credentials --resource-group '$(aksResourceGroup)' \
+                      --name '$(aksName)' \
+                      --overwrite-existing 
+
+                kubelogin convert-kubeconfig -l azurecli
+
+                kubectl config set-context --current --namespace '${{parameters.NAMESPACE}}'
+
+                kubectl get pods 2>&1
+
+          - task: AzureCLI@2
+            displayName: apply manifest
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+              scriptType: 'pscore'
+              powerShellErrorActionPreference: continue
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                
+                kubectl delete secret         $(jobName)-secret  2>&1 | Out-Null
+                kubectl create secret generic $(jobName)-secret --from-literal=AZURE_SAS_TOKEN='${{parameters.AZURE_STORAGE_ACCOUNT_SAS_TOKEN}}'
+
+                kubectl delete configmap      $(jobName)-config  2>&1 | Out-Null
+                kubectl create configmap      $(jobName)-config --from-literal=AZURE_STORAGE_ACCOUNT=$(AzureStorageAccount) `
+                                                                --from-literal=WORKSPACE=azure `
+                                                                --from-literal=AZURE_MODEL2_OUTPUT_CONTAINER=${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}} `
+                                                                --from-literal=AZURE_STORAGE_WORKSPACE_CONTAINER=${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}} `
+                                                                --from-literal=READ="azure"  `
+                                                                --from-literal=WRITE="azure"  `
+                                                                --from-literal=BYPASS_DOTENV="1"
+
+                # because this is a job, not a deployment, we do not have to do the "kubectl rollout restart"
+                kubectl delete cronjob $(jobName)-cronjob    2>&1 | Out-Null
+                cd '$(Pipeline.Workspace)'
+                $jobManifestFile = ((gci -recurse $(jobManifest)) | select -first 1)
+                kubectl apply -f  $jobManifestFile.fullname
+
+          - task: AzureCLI@2
+            displayName: 'Run once and Check job progress'
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+              scriptType: 'pscore'
+              powerShellErrorActionPreference: continue
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+
+                echo "== Run once job =="
+                $timestamp= Get-Date -Format "yyyyMMddHHmm"
+                $jobname = "$(jobName)-runonce-rel-$(Build.BuildNumber)-time-$Timestamp"
+
+                kubectl create job --from=cronjob/$(jobName)-cronjob $jobname
+
+                # this step replaces the "wait" function in the kubernetes task, which is not
+                # working properly for extremely long runnign jobs..
+                write-host "kubernetes resources available:"
+
+                #for the logs
+                kubectl get pods  2>&1 
+                kubectl get jobs  2>&1
+                kubectl get services  2>&1
+
+                # there may be more than one job, scope to just the one this pipeline cares about
+                
+                  try {
+                      $podSpec = kubectl get pods --selector=job-name=$jobname  -o json 2> $null | convertfrom-json
+                      $podname = $podspec.items[0].metadata.name
+                  }  
+                      catch {}
+                
+                $completionTime=$null
+                $logs=""
+                $Failed = $false
+                while (-not $failed -and $podName -and -not $completionTime) {
+                
+                  $jobSpec = kubectl get jobs  --selector=job-name=$jobname  -o json 2> $null | convertfrom-json
+                  $completionTime = $jobspec.items[0].status.completionTime
+                  $success=$jobspec.items[0].status.succeeded
+                  $initFailed= ($pods.items | select -First 1).status.initContainerStatuses | where .state.reason -match 'Error' 
+                  $failed= (($job.status.conditions.type -eq 'Failed') -or $initFailed)
+
+                  $previouslogs = $logs
+                  $logs= kubectl logs $podname  --all-containers --timestamps  2> $null
+                  if ($logs -eq $null) { $logs=""}
+                  compare-object -PassThru $previouslogs $logs
+                
+                  if (-not   $completionTime) {
+                      write-output "waiting for job $jobname to complete..."
+                      sleep 60
+                  }
+                }
+                
+                if (-not $podname) {
+                    write-output("No pods found for job $jobname")
+                    exit 1
+                    }
+                
+                $logs > "$(Build.ArtifactStagingDirectory)/$($jobname).logs"
+                
+                if (-not ( $success -gt 0 )) {
+                    write-output("Job $jobname failed")
+                    exit 1
+                    }
+                  
+                  write-output("Job $jobname succeeded")
+                
+                  exit 0
+
+
+===========================================================================================================================================================================================
+
+# deployscoreJobManifest.yaml
+
+parameters:
+  DEPLOYMENT_SERVICE_CONNECTION: 'NOT_DEFINE'
+  NAMESPACE: 'NOT_DEFINE'
+  AZURE_STORAGE_ACCOUNT: 'NOT_DEFINE'
+  AZURE_STORAGE_ACCOUNT_SAS_TOKEN: 'NOT_DEFINE'
+  ARTIFACT_NAME: 'NOT_DEFINE'
+  AZURE_MODEL2_OUTPUT_CONTAINER: 'NOT_DEFINE'
+  AZURE_STORAGE_WORKSPACE_CONTAINER: 'NOT_DEFINE'
+
+steps:  
+          - download: current
+            artifact: scratchpad
+
+
+===========================================================================================================================================================================================
+
+#  deployTrainJobManifest.yaml
+
+# job variables from pipeline
+#        $(jobName)
+#        $(jobManifest)
+#
+
+parameters:
+  DEPLOYMENT_SERVICE_CONNECTION: 'NOT_DEFINE'
+  NAMESPACE: 'NOT_DEFINE'
+  AZURE_STORAGE_ACCOUNT: 'NOT_DEFINE'
+  AZURE_STORAGE_ACCOUNT_SAS_TOKEN: 'NOT_DEFINE'
+  ARTIFACT_NAME: 'NOT_DEFINE'
+  AZURE_MODEL2_OUTPUT_CONTAINER: 'NOT_DEFINE'
+  AZURE_STORAGE_WORKSPACE_CONTAINER: 'NOT_DEFINE'
+
+steps:  
+          - download: current
+            artifact: scratchpad
+          - bash: |
+              TRAIN_TIMESTAMP=$(<'$(Pipeline.Workspace)/scratchpad/TrainTimestamp.txt') 
+              # expose timestamp in build variable
+              echo "##vso[task.setvariable variable=TrainTimestamp;]${TRAIN_TIMESTAMP}"
+            
+            displayName: 'Read training timestamp'
+
+          - bash: |
+              echo "TrainTimestamp is [$(TrainTimestamp)]"   
+            displayName: 'Show results of train timestamp'
+          
+          - template: updateInstalls.yml  # Template reference
+
+          - task: AzureCLI@2
+            displayName: Get storage account name
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}' 
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              addSpnToEnvironment: true
+              inlineScript: |
+
+                 gci -recurse * | select directory, name
+
+                 gci env: |  where Name -notmatch token | format-table -wrap
+
+                 write-output "Image name is $(TrainImageName):$(resources.pipeline.sourcetrainbuild.runName)"
+                 
+                 $storageAccounts=(az resource list -o json | convertfrom-json) | where type -eq "Microsoft.Storage/storageAccounts"
+                 $storageAccounts | format-table
+                 $AzureStorageAccount='${{parameters.AZURE_STORAGE_ACCOUNT}}'
+                 # if a specific storage account was not specified, take the storage account from the service connection
+                 if ($AzureStorageAccount -eq 'NOT_DEFINE') {
+                    $AzureStorageAccount = ($storageAccounts | select -First 1).name                   
+                    }
+                 Write-Host "##vso[task.setvariable variable=AzureStorageAccount;]$AzureStorageAccount"
+                 Write-host "using storage account $AzureStorageAccount"
+
+          - powershell: |
+              $AZURE_STORAGE_OUTPUT_CONTAINER='${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              $AZURE_STORAGE_WORKSPACE_CONTAINER='${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+
+              write-output 'storage account is $(AzureStorageAccount)'
+              write-output "AZURE_STORAGE_OUTPUT_CONTAINER=$AZURE_STORAGE_OUTPUT_CONTAINER"
+              write-output "AZURE_STORAGE_WORKSPACE_CONTAINER=$AZURE_STORAGE_WORKSPACE_CONTAINER "
+
+              # set up storage containers
+              $context = New-AzStorageContext -StorageAccountName '$(AzureStorageAccount)' -SasToken '${{parameters.AZURE_STORAGE_ACCOUNT_SAS_TOKEN}}'
+              $contents = Get-AZStorageContainer -context $context
+            
+              if (-not ( $contents | where name -eq $AZURE_STORAGE_OUTPUT_CONTAINER)) {
+                 New-AzStorageContainer -context $context -name $AZURE_STORAGE_OUTPUT_CONTAINER  -Permission Container
+              }
+              if (-not ( $contents | where name -eq $AZURE_STORAGE_WORKSPACE_CONTAINER)) {
+                New-AzStorageContainer -context $context -name $AZURE_STORAGE_WORKSPACE_CONTAINER -Permission Container
+              }
+            
+              # create a manifest which reflects the correct build
+
+              (gc 'deployment/kubernetes/$(jobManifest)').replace('{TRAIN_TIMESTAMP}','$(TrainTimestamp)').replace('$(TrainImageName):latest','$(TrainImageName):$(resources.pipeline.sourcetrainbuild.runName)') `
+                  > $(Build.ArtifactStagingDirectory)/$(jobManifest)
+            
+              gc $(Build.ArtifactStagingDirectory)/$(jobManifest)
+
+            displayName: 'Prepare to run training through aks'
+
+          - task: PowerShell@2
+            displayName: 'Check Environment variables'
+            inputs:
+                targetType: 'inline'
+                script: |
+                  # Write your PowerShell commands here.
+                      
+                  gci env: | format-table -wrap
+                  gci  -recurse | select fullname
+          
+          - task: AzureCLI@2
+            displayName: Get aks cluster name
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              addSpnToEnvironment: true
+              inlineScript: |
+                # we arent using az aks list anymore as it's not working consistently in al environments
+                $resources = az resource list -o json | convertfrom-json       
+                $aksList = $resources | where 'type' -eq 'Microsoft.ContainerService/managedClusters'
+                $aksList | format-table
+                $aksName='$(aksName)'
+                $aksResourceGroup='$(aksResourceGroup)'
+                # use specific aks is named, otherwise derive from service connection permissions
+                if (('set in script' -eq $aksResourceGroup) -or ('set in script' -eq $aksName))
+                {
+                  write-host "Setting aks from service connection environment"
+                  $aksName = ($aksList | select -First 1).name
+                  $aksResourceGroup= ($aksList | select -First 1).resourceGroup
+                }
+                Write-host "using aks $aksName resource group $aksResourceGroup "
+                Write-Host "##vso[task.setvariable variable=aksName;]$aksName"
+                Write-Host "##vso[task.setvariable variable=aksResourceGroup;]$aksResourceGroup"  
+          
+          - task: AzureCLI@2
+            displayName: use kubelogin to connect
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+
+                Write-host "using aks $(aksName) resource group $(aksResourceGroup)"
+                rm -f ".kube/config" &&  az aks get-credentials --resource-group '$(aksResourceGroup)' \
+                      --name '$(aksName)' \
+                      --overwrite-existing 
+
+                kubelogin convert-kubeconfig -l azurecli
+
+                kubectl config set-context --current --namespace '${{parameters.NAMESPACE}}'
+
+                kubectl get pods 2>&1
+
+          - task: AzureCLI@2
+            displayName: apply manifest
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+              scriptType: 'pscore'
+              powerShellErrorActionPreference: continue
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                
+                kubectl delete secret         $(jobName)-secret  2>&1 | Out-Null
+                kubectl create secret generic $(jobName)-secret --from-literal=AZURE_SAS_TOKEN='${{parameters.AZURE_STORAGE_ACCOUNT_SAS_TOKEN}}'
+
+                kubectl delete configmap      $(jobName)-config  2>&1 | Out-Null
+                kubectl create configmap      $(jobName)-config --from-literal=AZURE_STORAGE_ACCOUNT=$(AzureStorageAccount) `
+                                                                    --from-literal=WORKSPACE=azure `
+                                                                    --from-literal=AZURE_MODEL2_OUTPUT_CONTAINER=${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}} `
+                                                                    --from-literal=AZURE_STORAGE_WORKSPACE_CONTAINER=${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}
+
+                # because this is a job, not a deployment, we do not have to do the "kubectl rollout restart"
+                kubectl apply -f  $(Build.ArtifactStagingDirectory)/$(jobManifest)
+              
+                # outputFormat: yaml
+          - task: AzureCLI@2
+            displayName: 'Check job progress'
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+              scriptType: 'pscore'
+              powerShellErrorActionPreference: continue
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # this step replaces the "wait" function in the kubernetes task, which is not
+                # working properly for extremely long runnign jobs..
+                write-host "kubernetes resources available:"
+
+                #for the logs
+                kubectl get pods  2>&1 
+                kubectl get jobs  2>&1
+                kubectl get services  2>&1
+
+                # there may be more than one job, scope to just the one this pipeline cares about
+                $jobname = "$(jobName)-sequenced-job-$(TrainTimestamp)"
+                
+                  try {
+                      $podSpec = kubectl get pods --selector=job-name=$jobname  -o json 2> $null | convertfrom-json
+                      $podname = $podspec.items[0].metadata.name
+                  }  
+                      catch {}
+                
+                $completionTime=$null
+                $logs=""
+                $Failed = $false
+                while (-not $failed -and $podName -and -not $completionTime) {
+                
+                  $jobSpec = kubectl get jobs  --selector=job-name=$jobname  -o json 2> $null | convertfrom-json
+                  $completionTime = $jobspec.items[0].status.completionTime
+                  $success=$jobspec.items[0].status.succeeded
+                  $initFailed= ($pods.items | select -First 1).status.initContainerStatuses | where .state.reason -match 'Error' 
+                  $failed= (($job.status.conditions.type -eq 'Failed') -or $initFailed)
+
+                  $previouslogs = $logs
+                  $logs= kubectl logs $podname  --all-containers --timestamps  2> $null
+                  if ($logs -eq $null) { $logs=""}
+                  compare-object -PassThru $previouslogs $logs
+                
+                  if (-not   $completionTime) {
+                      write-output "waiting for job $jobname to complete..."
+                      sleep 60
+                  }
+                }
+                
+                if (-not $podname) {
+                    write-output("No pods found for job $jobname")
+                    exit 1
+                    }
+                
+                $logs > "$(Build.ArtifactStagingDirectory)/$($jobname).logs"
+                
+                if (-not ( $success -gt 0 )) {
+                    write-output("Job $jobname failed")
+                    exit 1
+                    }
+                  
+                  write-output("Job $jobname succeeded")
+                
+                  exit 0
+
+
+          - bash: |
+              # place production train timestamp in a file to be available to future stages
+              echo "$(TrainTimestamp)" >  TrainTimestamp.txt
+              echo "Branch is $(resources.pipeline.sourcetrainbuild.sourceBranch)"
+            displayName: 'record production train timestamp'
+          - task: CopyFiles@2
+            displayName: 'Copy final production timestamp file for use by other pipelines'
+            inputs:
+              contents: 'TrainTimestamp.txt'
+              targetFolder: '$(Build.ArtifactStagingDirectory)'
+          - publish: '$(Build.ArtifactStagingDirectory)'
+            displayName: 'Publish timestamp file for later use'
+            artifact: ${{parameters.ARTIFACT_NAME}}
+
+
+===========================================================================================================================================================================================
+
+
+
+
+# updateInstalls.yaml
+
+steps:
+    - task: Bash@3
+      displayName: install zip
+      inputs:
+        targetType: 'inline'
+        script: |
+          which zip
+          if [ ! -f /usr/bin/zip ]
+          then
+             sudo apt-get -y install zip
+          fi
+    - task: HelmInstaller@0
+      displayName: Install Kubernetes/Helm
+      inputs:
+        helmVersion: '2.14.1'
+        installKubectl: true
+    - task: Bash@3
+      displayName: Install kubelogin
+      inputs:
+        targetType: 'inline'
+        script: |
+          # get kubelogin
+          if [ ! -f /usr/bin/kubelogin ]
+          then
+            wget https://github.com/Azure/kubelogin/releases/download/v0.0.9/kubelogin-linux-amd64.zip
+            unzip kubelogin-linux-amd64.zip
+            sudo mv bin/linux_amd64/kubelogin /usr/bin
+          fi 
+    - task: AzureCLI@2
+      name: "Install_azure_modules"
+      inputs:
+        azureSubscription: 'cfo-apps-revpred-deploy-dev-AKSLOWDEVPRV001'    # dont really care what subscription, any valid will do
+        scriptType: 'pscore'
+        scriptLocation: 'inlineScript'
+        failOnStandardError: false
+        powerShellErrorActionPreference: 'continue'
+        inlineScript: |
+
+          if (-not (Get-Module -list 'az.accounts')) {
+            Install-Module az.accounts -Scope CurrentUser -Force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'az.resources'))  {
+            Install-Module az.resources -scope currentuser -force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'az.storage'))  {
+            Install-Module az.storage -scope currentuser -force -SkipPublisherCheck 
+            }
+
+
+===========================================================================================================================================================================================
+
+#  azure-daily-storage-container-test.yaml
+
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger: none
+pool: "msalowgts-devopvmss"
+pr: none
+schedules:
+- cron: "0 13 * * *"
+  displayName: Daily at 8am (UTC)
+  branches:
+    include:
+    - master
+  always: true
+stages:
+- stage: dev
+  jobs:
+  - job: run_tests
+    steps:
+    - task: AzureCLI@2
+      name: "Execute_Pester_Tests"
+      inputs:
+        azureSubscription: 'cfo-apps-revpred-deploy-dev-AKSLOWDEVPRV001'
+        scriptType: 'pscore'
+        scriptLocation: 'inlineScript'
+        failOnStandardError: false
+        powerShellErrorActionPreference: 'continue'
+        inlineScript: |
+          pwd
+          gci -recurse *
+
+          write-host "Using storage account $(StorageAccountName)"
+          # setup server environment to run azure pester tests
+          if (-not (Get-Module -list 'az.accounts')) {
+            Install-Module az.accounts -Scope CurrentUser -Force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'az.resources'))  {
+            Install-Module az.resources -scope currentuser -force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'az.storage'))  {
+            Install-Module az.storage -scope currentuser -force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'Pester'))  {
+             Install-Module -Name Pester -Force -MaximumVersion 4.99.99 -SkipPublisherCheck 2>&1
+          }
+          Import-Module Pester -MaximumVersion 4.99.99
+          
+          # get the test files
+          $TestFiles=$(get-childitem -path $env:BUILD_SOURCESDIRECTORY -recurse *Test*.ps1).fullname
+          foreach ($TestFile in $TestFiles) {
+            write-host "Executing tests for $TestFile"
+            $VerbosePreference='continue'
+            Invoke-Pester -Script @{ Path=$TestFile; Parameters=@{StorageAccountName = '$(StorageAccountName)'; StorageAccountKey = '$(StorageAccountKey)' ;extraContainer = '$(extraContainer)'; extraBlob ='$(extraBlob)'} }  -OutputFile "./Test-Pester.xml" -OutputFormat 'NUnitXML'
+          }
+          
+          # list results
+          gci .
+
+    -     task: PublishTestResults@2
+          inputs:
+            testResultsFormat: 'NUnit'
+            testResultsFiles: '**/Test-*.xml'
+            failTaskOnFailedTests: true
+            buildConfiguration: 'Development'
+            testRunTitle: 'RPM Storage Tests for $(StorageAccountName) (Dev)'
+- stage: prod
+  dependsOn: []
+  condition: contains(variables['runOnProd'], 'true')
+  jobs:
+  - job: run_tests
+    steps:
+    - task: AzureCLI@2
+      name: "Ensure_AZ_CLI_is_present"
+      inputs:
+        azureSubscription: 'cfo-apps-revpred-deploy-prod-AKSLOWPRODPRV002'
+        scriptType: 'pscore'
+        scriptLocation: 'inlineScript'
+        failOnStandardError: false
+        powerShellErrorActionPreference: 'continue'
+        inlineScript: |
+          pwd
+          gci -recurse *
+
+          write-host "Using storage account $(StorageAccountNameProd)"
+          # setup server environment to run azure pester tests
+          if (-not (Get-Module -list 'az.accounts')) {
+            Install-Module az.accounts -Scope CurrentUser -Force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'az.resources'))  {
+            Install-Module az.resources -scope currentuser -force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'az.storage'))  {
+            Install-Module az.storage -scope currentuser -force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'Pester'))  {
+             Install-Module -Name Pester -Force -MaximumVersion 4.99.99 -SkipPublisherCheck 2>&1
+          }
+          Import-Module Pester -MaximumVersion 4.99.99
+          
+          # get the test files
+          $TestFiles=$(get-childitem -path $env:BUILD_SOURCESDIRECTORY -recurse *Test*.ps1).fullname
+          foreach ($TestFile in $TestFiles) {
+            write-host "Executing tests for $TestFile"
+            $VerbosePreference='continue'
+            Invoke-Pester -Script @{ Path=$TestFile; Parameters=@{StorageAccountName = '$(StorageAccountNameProd)'; StorageAccountKey = '$(StorageAccountKeyProd)'} }  -OutputFile "./Test-Pester.xml" -OutputFormat 'NUnitXML'
+          }
+          
+          # list results
+          gci .
+
+    -     task: PublishTestResults@2
+          inputs:
+            testResultsFormat: 'NUnit'
+            testResultsFiles: '**/Test-*.xml'
+            failTaskOnFailedTests: true
+            buildConfiguration: 'Production'
+            testRunTitle: 'RPM Storage Tests for $(StorageAccountNameProd) (Prod)'
+
+
+
+===========================================================================================================================================================================================
+
+# cleanup-images-azure-pipelines.yaml
+
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger: none
+
+pool: "vmss Linux RTI network"
+
+steps:
+  - task: Bash@3
+    displayName: Clean Up old Images and containers
+    inputs:
+      targetType: 'inline'
+      script: |
+        docker system prune -af
+
+
+===========================================================================================================================================================================================
+
+# consolidated_aks_scoring_deployment.yaml
+
+trigger: 
+ paths:
+  include:
+   - scoring-pipeline-azure.yml
+   - pipeline-templates
+   - deployment 
+ branches:
+  include:
+   - master
+   - main
+   - develop
+parameters:
+- name: AZURE_MODEL2_OUTPUT_CONTAINER
+  displayName: AZURE_MODEL2_OUTPUT_CONTAINER
+  type: string
+  default: model2-output
+- name: AZURE_STORAGE_WORKSPACE_CONTAINER
+  displayName: AZURE_STORAGE_WORKSPACE_CONTAINER
+  type: string
+  default: autotrain-workspace
+# Pipeline triggered by a pipeline
+resources:
+  pipelines:
+   - pipeline: m1m2sourcescorebuild
+     project: "Revenue Prediction"
+     source: "[Build] M1M2 score image"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+   - pipeline: m3sourcescorebuild
+     project: "Revenue Prediction"
+     source: "[Build] M3 score image"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+   - pipeline: m4sourcescorebuild
+     project: "Revenue Prediction"
+     source: "[Build] M4 score image"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+   - pipeline: m5sourcescorebuild
+     project: "Revenue Prediction"
+     source: "[Build] M5 score image"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+   - pipeline: m1m2sourcetrainartifactbuild
+     project: "Revenue Prediction"
+     source: "[Build] M1M2 train artifact"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+   - pipeline: m3sourcetrainartifactbuild
+     project: "Revenue Prediction"
+     source: "[Build] M3 train artifact"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+   - pipeline: m4sourcetrainartifactbuild
+     project: "Revenue Prediction"
+     source: "[Build] M4 train artifact"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+variables:
+- group: 'Azure Variables'
+- name: scoreTimestamp
+  value: SetByInitialStage
+- name: scoreImageName
+  value: revenue-prediction-m1-m2-score
+- name: jobName
+  value: model-scoring
+- name: jobManifest
+  value: model-scoring-job.yaml
+- name: m1m2ScoreImageName
+  value: rtirevenueprediction.azurecr.io/revenue-prediction-m1-m2
+- name: m3ScoreImageName
+  value: rtirevenueprediction.azurecr.io/revenue-prediction-m3-score
+- name: m4ScoreImageName
+  value: rtirevenueprediction.azurecr.io/revenue-prediction-m4-score
+- name: m5ScoreImageName
+  value: rtirevenueprediction.azurecr.io/revenue-prediction-m5
+- name: m1-m2-score-at-main
+  value: $[or(eq(variables['resources.pipeline.m1m2sourcescorebuild.sourceBranch'], 'refs/heads/main'), eq(variables['resources.pipeline.m1m2sourcescorebuild.sourceBranch'], 'refs/heads/master'))]
+- name: m3-score-at-main
+  value: $[or(eq(variables['resources.pipeline.m3sourcescorebuild.sourceBranch'], 'refs/heads/main'), eq(variables['resources.pipeline.m3sourcescorebuild.sourceBranch'], 'refs/heads/master'))]
+- name: m4-score-at-main
+  value: $[or(eq(variables['resources.pipeline.m4sourcescorebuild.sourceBranch'], 'refs/heads/main'), eq(variables['resources.pipeline.m4sourcescorebuild.sourceBranch'], 'refs/heads/master'))]
+- name: m5-score-at-main
+  value: $[or(eq(variables['resources.pipeline.m5sourcescorebuild.sourceBranch'], 'refs/heads/main'), eq(variables['resources.pipeline.m5sourcescorebuild.sourceBranch'], 'refs/heads/master'))]
+- name: score-at-main
+  value: $[and(and(and(eq(variables['m1-m2-score-at-main'],'True'), eq(variables['m3-score-at-main'],'True')),eq(variables['m4-score-at-main'],'True')),eq(variables['m5-score-at-main'],'True'))]
+- name: m1-m2-train-artifact-at-main
+  value: $[or(eq(variables['resources.pipeline.m1m2sourcetrainartifactbuild.sourceBranch'], 'refs/heads/main'), eq(variables['resources.pipeline.m1m2sourcetrainartifactbuild.sourceBranch'], 'refs/heads/master'))]
+- name: m3-train-artifact-at-main
+  value: $[or(eq(variables['resources.pipeline.m3sourcetrainartifactbuild.sourceBranch'], 'refs/heads/main'), eq(variables['resources.pipeline.m3sourcetrainartifactbuild.sourceBranch'], 'refs/heads/master'))]
+- name: m4-train-artifact-at-main
+  value: $[or(eq(variables['resources.pipeline.m4sourcetrainartifactbuild.sourceBranch'], 'refs/heads/main'), eq(variables['resources.pipeline.m4sourcetrainartifactbuild.sourceBranch'], 'refs/heads/master'))]
+- name: train-artifact-at-main
+  value: $[and(and(eq(variables['m1-m2-train-artifact-at-main'],'True'), eq(variables['m3-train-artifact-at-main'],'True')),eq(variables['m4-train-artifact-at-main'],'True'))]
+- name: all-pipelines-at-main
+  value: $[and(eq(variables['score-at-main'],'True'), eq(variables['train-artifact-at-main'],'True'))]
+- name: trainTimestamp
+  value: setInScript
+- name: m3trainTimestamp
+  value: setInScript
+- name: m4trainTimestamp
+  value: setInScript
+stages:
+- stage: SetTimestamp
+  displayName: Set the Timestamp for the scoring data and Prepare the Yaml
+  jobs:  
+  - job: Prepare
+    displayName: Prepare
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    steps:
+    - download: m1m2sourcetrainartifactbuild
+      artifact: devresults
+    - download: m3sourcetrainartifactbuild
+      artifact: devresults
+    - download: m4sourcetrainartifactbuild
+      artifact: devresults
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: 'gci env:RESOURCES* | Sort-Object -Property key | format-table -wrap'
+      displayName: 'Display environment'
+    - bash: |
+        find .
+        train_TIMESTAMP=`cat $(PIPELINE.WORKSPACE)/m1m2sourcetrainartifactbuild/devresults/TrainTimestamp.txt`
+        # expose timestamp in build variable
+        echo "##vso[task.setvariable variable=trainTimestamp]${train_TIMESTAMP}" 
+        m3_train_TIMESTAMP=`cat $(PIPELINE.WORKSPACE)/m3sourcetrainartifactbuild/devresults/TrainTimestamp.txt`
+        # expose timestamp in build variable
+        echo "##vso[task.setvariable variable=m3trainTimestamp]${m3_train_TIMESTAMP}" 
+        m4_train_TIMESTAMP=`cat $(PIPELINE.WORKSPACE)/m4sourcetrainartifactbuild/devresults/TrainTimestamp.txt`
+        # expose timestamp in build variable 
+        echo "##vso[task.setvariable variable=m4trainTimestamp]${m4_train_TIMESTAMP}"                 
+      displayName: 'Set training timestamp'
+    - bash: |
+        echo "trainTimestamp is [$(trainTimestamp)]"   
+        echo "m3trainTimestamp is [$(m3trainTimestamp)]"  
+        echo "m4trainTimestamp is [$(m4trainTimestamp)]" 
+        echo "m1-m2-score-at-main for [$(resources.pipeline.m1m2sourcescorebuild.sourceBranch)] is [$(m1-m2-score-at-main)]"  
+        echo "m3-score-at-main for [$(resources.pipeline.m3sourcescorebuild.sourceBranch)] is [$(m3-score-at-main)]"  
+        echo "m4-score-at-main for [$(resources.pipeline.m4sourcescorebuild.sourceBranch)] is [$(m4-score-at-main)]"  
+        echo "m5-score-at-main for [$(resources.pipeline.m5sourcescorebuild.sourceBranch)] is [$(m5-score-at-main)]"  
+        echo "score-at-main is [$(score-at-main)]"  
+        echo "m1-m2-train-artifact-at-main for [$(resources.pipeline.m1m2sourcetrainartifactbuild.sourceBranch)] is [$(m1-m2-train-artifact-at-main)]"  
+        echo "m3-train-artifact-at-main for [$(resources.pipeline.m3sourcetrainartifactbuild.sourceBranch)] is [$(m3-train-artifact-at-main)]"  
+        echo "m4-train-artifact-at-main for [$(resources.pipeline.m4sourcetrainartifactbuild.sourceBranch)] is [$(m4-train-artifact-at-main)]"  
+        echo "train-artifact-at-main is [$(train-artifact-at-main)]"  
+        echo "all-pipelines-at-main is [$(all-pipelines-at-main)]" 
+      displayName: 'Show results of train timestamp'
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: |
+            # no need to set up storage containers - training will have done this first
+
+            # create a manifest which reflects the correct build
+            # the following elements need to be replaced: 
+            # {score_TIMESTAMP}
+            # {train_TIMESTAMP}
+            # {M3_train_TIMESTAMP}
+            # {M4_train_TIMESTAMP}"
+            # $(m12ScoreImageName):latest
+            # $(m3ScoreImageName):latest
+            # $(m4ScoreImageName):latest
+            # $(m5ScoreImageName):latest     
+
+            write-host '{TRAIN_TIMESTAMP}= $(trainTimestamp)' 
+            write-host '{M3_TRAIN_TIMESTAMP}= $(m3trainTimestamp)' 
+            write-host '{M4_TRAIN_TIMESTAMP}= $(m4trainTimestamp)' 
+            write-host 'm1m2ScoreImageName= $(m1m2ScoreImageName):$(resources.pipeline.m1m2sourcescorebuild.runName)' 
+            write-host 'm3ScoreImageName= $(m3ScoreImageName):$(resources.pipeline.m3sourcescorebuild.runName)' 
+            write-host 'm4ScoreImageName= $(m4ScoreImageName):$(resources.pipeline.m4sourcescorebuild.runName)' 
+            write-host 'm5ScoreImageName= $(m5ScoreImageName):$(resources.pipeline.m5sourcescorebuild.runName)' 
+
+            $manifestfile = (gci -recurse $(jobManifest) ) | select -first 1
+            $manifest = (gc $manifestfile) `
+               -replace '{TRAIN_TIMESTAMP}',                   '$(trainTimestamp)' `
+               -replace '{M3_TRAIN_TIMESTAMP}',                '$(m3trainTimestamp)' `
+               -replace '{M4_TRAIN_TIMESTAMP}',                '$(m4trainTimestamp)' `
+               -replace '$(m1m2ScoreImageName):.[^/s]*','$(m1m2ScoreImageName):$(resources.pipeline.m1m2sourcescorebuild.runName)' `
+               -replace '$(m3ScoreImageName):.[^/s]*',   '$(m3ScoreImageName):$(resources.pipeline.m3sourcescorebuild.runName)' `
+               -replace '$(m4ScoreImageName):.[^/s]*',   '$(m4ScoreImageName):$(resources.pipeline.m4sourcescorebuild.runName)' `
+               -replace '$(m5ScoreImageName):.[^/s]*',   '$(m5ScoreImageName):$(resources.pipeline.m5sourcescorebuild.runName)' `
+               > $(Build.ArtifactStagingDirectory)/$(jobManifest)
+      
+            gc $(Build.ArtifactStagingDirectory)/$(jobManifest)
+
+
+    - publish: '$(Build.ArtifactStagingDirectory)'
+      displayName: 'Publish yaml file for inspection'
+      artifact: kubernetes
+                  
+- stage: Devscore
+  displayName: Dev- Deploy scoring cronjob
+  dependsOn: SetTimestamp
+  variables:
+    aksName: 'set in script'
+    aksResourceGroup: 'set in script'
+    namespace: 'set in script'
+    AzureStorageAccount: 'set in script'
+  jobs:  
+  - deployment: scoring
+    environment: development
+    displayName: Deploy scoring cronjob
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: 'current'
+              artifactName: 'kubernetes'
+              targetPath: '$(Pipeline.Workspace)'
+          - template: ./pipeline-templates/deployScoreJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-dev-AKSLOWDEVPRV001
+              NAMESPACE: cfo-apps-revpred-dev
+              AZURE_STORAGE_ACCOUNT: revpredtempblobdev
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenDev)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: devscoreresults
+- stage: Prodscore
+  displayName: Production- Deploy scoring cronjob
+  dependsOn: Devscore
+  condition: and(succeeded(), eq(variables['all-pipelines-at-main'],'true'))
+  variables:
+    aksName: 'set in script'
+    aksResourceGroup: 'set in script'
+    namespace: 'set in script'
+    AzureStorageAccount: 'set in script'
+  jobs:  
+  - deployment: scoring
+    environment: production
+    displayName: Deploy scoring cronjob
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: 'current'
+              artifactName: 'kubernetes'
+              targetPath: '$(Pipeline.Workspace)'
+          - template: pipeline-templates/deployScoreJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-prod-AKSLOWPRODPRV002
+              NAMESPACE: cfo-apps-revpred-prod
+              AZURE_STORAGE_ACCOUNT: revpredtempblob
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenProd)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: prodscoreresults
+
+
+
+===========================================================================================================================================================================================
+
+# daily-extract-azure-pipeline.yaml
+
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger: none
+pool: "msalowgts-devopvmss"
+pr: none
+schedules:
+- cron: "0 12 * * *"
+  displayName: Daily at 7am (UTC)
+  branches:
+    include:
+    - master
+  always: true
+variables:
+- group: 'Azure Variables'
+stages:
+- stage: prod
+  jobs:
+  - job: run_extract
+    steps:
+    - task: AzureCLI@2
+      name: "Run_Extract"
+      inputs:
+        azureSubscription: 'cfo-apps-revpred-deploy-prod-AKSLOWPRODPRV002'
+        scriptType: 'pscore'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+
+          Install-Module -Name Az.Storage -AllowClobber -Scope CurrentUser -Force
+          
+          $contextFrom = New-AzStorageContext -StorageAccountName '$(AzureStorageAccountProd)' -SasToken '$(AzureSASTokenProd)'
+          $contextTo =  New-AzStorageContext -StorageAccountName '$(AzureStorageAccountExtract)' -SasToken '$(AzureSASTokenExtract)'
+
+          $blobContainers=@()
+          Get-AzStorageContainer -context $contextFrom -verbose
+          $original=Get-AzStorageContainer -context $contextFrom 
+          $original |  % { $blobContainers += Get-AzStorageBlob -Container $_.Name -Context $contextFrom }
+
+          [DateTime] $LastModifiedSince = [DateTime]::Now.AddDays(-1)
+
+          $modifiedBlobs = $blobContainers | ?{ ($_.LastModified -gt  "$LastModifiedSince")}
+          $modifiedContainers = $blobContainers | select -expand BlobClient  | select -expand BlobContainerName -unique
+          write-host "modified containers"
+          $modifiedContainers | Out-String | Write-host
+          write-host "modified blobs"
+          $modifiedBlobs | Out-String | Write-host
+          
+          # create containers needed for the blob copy
+          $modifiedContainers | % { 
+            If (-not (Get-AzStorageContainer -name $_ -Context $contextTo )) { 
+              write-host New-AzStorageContainer -Name "$_"  -Context $contextTo.StorageAccountName 
+              if (-not $dryrun) {
+                New-AzStorageContainer -Name "$_"  -Context $contextTo 
+                }
+              }
+            }
+
+          $modifiedBlobs | % {
+              # copy the blob
+              Write-host Start-AzStorageBlobCopy `
+                  -SrcContainer $_.BlobClient.BlobContainerName `
+                  -SrcBlob $_.Name `
+                  -DestContainer $_.BlobClient.BlobContainerName `
+                  -DestBlob $_.Name  `
+                  -Context $contextFrom.StorageAccountName `
+                  -DestContext $contextTo.StorageAccountName `
+                  -Force
+              if (-not $dryrun) {
+                  Start-AzStorageBlobCopy `
+                    -SrcContainer $_.BlobClient.BlobContainerName `
+                    -SrcBlob $_.Name `
+                    -DestContainer $_.BlobClient.BlobContainerName `
+                    -DestBlob $_.Name  `
+                    -Context $contextFrom `
+                    -DestContext $contextTo `
+                    -Force
+                    }
+                  }
+          # clean any files greater than the specified number of days old from extract
+          $daysToKeep = "$(daysToKeep)"
+          if ($daysToKeep -ne "") {
+            $blobs=@()
+            Get-AzStorageContainer -context $contextTo | % { 
+                    $blobs += Get-AzStorageBlob -Container $_.Name -Context $contextTo
+                    }
+            write-host "found files on $contextTo.StorageAccountName"
+            $blobs | select -expand BlobClient | Out-String | Write-host
+            $old = $blobs | ?{ ($_.LastModified -lt  $([DateTime]::Now.AddDays(-$daysToKeep))) } 
+            write-host "Removing files more than $(daysToKeep) days old"
+            $old | select -expand BlobClient | Out-String | Write-host
+            if (-not $dryrun) {
+              $old | Remove-AzStorageBlob -context $contextTo
+              }
+            }
+
+
+
+===========================================================================================================================================================================================
+
+# dev.create-excel-files.sh
+
+#!/bin/bash
+
+curl -H "Content-Type: application/json" -X POST -d '{}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"DS"}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"TAC"}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"IA"}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"India"}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES"}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"Analytics"}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"Communication"}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"Data"}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"Education"}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"Environment"}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"Health"}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"Justice"}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"Technology"}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"TRUE"}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"IDG"}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"IDG","unit":"GH"}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"IDG","unit":"SG&R"}' https://revpred-dev.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"IDG","unit":"Int'"'"'l Ed"}' https://revpred-dev.rti.org/api/excel
+
+
+
+===========================================================================================================================================================================================
+
+#  m3-training-pipeline-azure.yaml
+
+trigger:
+ paths:
+  include:
+   - m3-training-pipeline-azure.yml
+ branches:
+  include:
+   - main
+   - master
+   - develop
+parameters:
+- name: AZURE_MODEL2_OUTPUT_CONTAINER
+  displayName: AZURE_MODEL2_OUTPUT_CONTAINER
+  type: string
+  default: autotrain-model2-output
+- name: AZURE_STORAGE_WORKSPACE_CONTAINER
+  displayName: AZURE_STORAGE_WORKSPACE_CONTAINER
+  type: string
+  default: autotrain-workspace
+schedules:
+- cron: "00 05 01 02,05,08,11 *"
+  displayName: Quarterly at Midnight (EST)
+  branches:
+    include:
+    - master
+  always: true
+# Pipeline triggered by a pipeline
+resources:
+  pipelines:
+   - pipeline: sourcetrainbuild
+     project: "Revenue Prediction"
+     source: "[Build] M3 train image"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+  repositories:
+  - repository: scripts
+    type: git
+    name: Revenue Prediction/pipeline scripts
+    ref: master
+variables:
+- group: 'Azure Variables'
+- name: TrainTimestamp
+  value: SetByInitialStage
+- name: TrainImageName
+  value: revenue-prediction-m3-train
+- name: jobName
+  value: m3-model-training
+- name: jobManifest
+  value: m3-model-training-job.yaml
+stages:
+- stage: SetTimestamp
+  displayName: Set the Timestamp for the training data
+  jobs:  
+  - job: Prepare
+    displayName: Prepare
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    steps:
+    - checkout: scripts
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: 'gci env:RESOURCES* | Sort-Object -Property key | format-table -wrap'
+      displayName: 'Display environment'
+    - bash: |
+        TRAIN_TIMESTAMP="$(date +"%Y%m%d%H%M")"
+        # place in a file to be available to future stages
+        echo "${TRAIN_TIMESTAMP}" >  TrainTimestamp.txt
+        # expose timestamp in build variable
+        echo "##vso[task.setvariable variable=TrainTimestamp;]${TRAIN_TIMESTAMP}" 
+      displayName: 'Set training timestamp'
+    - task: CopyFiles@2
+      displayName: 'Copy timestamp file for later use in the pipeline'
+      inputs:
+        contents: 'TrainTimestamp.txt'
+        targetFolder: '$(Build.ArtifactStagingDirectory)'
+    - publish: '$(Build.ArtifactStagingDirectory)'
+      displayName: 'Publish timestamp file for later use'
+      artifact: scratchpad
+    - bash: |
+        echo "TrainTimestamp is [$(TrainTimestamp)]"   
+      displayName: 'Show results of train timestamp'
+
+- stage: DevTrain
+  displayName: Dev- Generate and publish training data
+  dependsOn: SetTimestamp
+  variables:
+    aksName: 'set in script'
+    aksResourceGroup: 'set in script'
+    namespace: 'set in script'
+    AzureStorageAccount: 'set in script'
+  jobs:  
+  - deployment: Training
+    environment: development
+    displayName: Generate and publish training data
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+          - checkout: scripts
+          - template: pipeline-templates/deployTrainJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-dev-AKSLOWDEVPRV001
+              NAMESPACE: cfo-apps-revpred-dev
+              AZURE_STORAGE_ACCOUNT: revpredtempblobdev
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenDev)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: devresults
+- stage: ProdTrain
+  displayName: Production- Generate and publish training data
+  dependsOn: DevTrain
+  # todo: change build.sourceBranch to resources.pipeline.sourceTrainBuild.sourceBranch for other artifact
+  condition: and(succeeded(), or(eq(variables['resources.pipeline.sourceTrainBuild.sourceBranch'], 'refs/heads/main'),eq(variables['resources.pipeline.sourceTrainBuild.sourceBranch'], 'refs/heads/master')))
+  variables:
+    aksName: 'set in script'
+    aksResourceGroup: 'set in script'
+    namespace: 'set in script'
+    AzureStorageAccount: 'set in script'
+  jobs:  
+  - deployment: Training
+    environment: trainingforproduction
+    displayName: Generate and publish training data
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+          - checkout: scripts
+          - template: pipeline-templates/deployTrainJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-prod-AKSLOWPRODPRV002
+              NAMESPACE: cfo-apps-revpred-prod
+              AZURE_STORAGE_ACCOUNT: revpredtempblob
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenProd)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: prodresults
+
+
+
+===========================================================================================================================================================================================
+
+===========================================================================================================================================================================================
+
+# m4-training-pipeline-azure.yaml
+
+trigger:
+ paths:
+  include:
+   - m4-training-pipeline-azure.yaml
+ branches:
+  include:
+   - main
+   - master
+   - develop
+parameters:
+- name: AZURE_MODEL2_OUTPUT_CONTAINER
+  displayName: AZURE_MODEL2_OUTPUT_CONTAINER
+  type: string
+  default: autotrain-model2-output
+- name: AZURE_STORAGE_WORKSPACE_CONTAINER
+  displayName: AZURE_STORAGE_WORKSPACE_CONTAINER
+  type: string
+  default: autotrain-workspace
+schedules:
+- cron: "00 05 01 02,05,08,11 *"
+  displayName: Quarterly at Midnight (EST)
+  branches:
+    include:
+    - master
+  always: true
+# Pipeline triggered by a pipeline
+resources:
+  pipelines:
+   - pipeline: sourcetrainbuild
+     project: "Revenue Prediction"
+     source: "[Build] M4 train image"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+  repositories:
+  - repository: scripts
+    type: git
+    name: Revenue Prediction/pipeline scripts
+    ref: master
+variables:
+- group: 'Azure Variables'
+- name: TrainTimestamp
+  value: SetByInitialStage
+- name: TrainImageName
+  value: revenue-prediction-m4-train
+- name: jobName
+  value: m4-model-training
+- name: jobManifest
+  value: m4-model-training-job.yaml
+stages:
+- stage: SetTimestamp
+  displayName: Set the Timestamp for the training data
+  jobs:  
+  - job: Prepare
+    displayName: Prepare
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    steps:
+    - checkout: scripts
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: 'gci env:RESOURCES* | Sort-Object -Property key | format-table -wrap'
+      displayName: 'Display environment'
+    - bash: |
+        TRAIN_TIMESTAMP="$(date +"%Y%m%d%H%M")"
+        # place in a file to be available to future stages
+        echo "${TRAIN_TIMESTAMP}" >  TrainTimestamp.txt
+        # expose timestamp in build variable
+        echo "##vso[task.setvariable variable=TrainTimestamp;]${TRAIN_TIMESTAMP}" 
+      displayName: 'Set training timestamp'
+    - task: CopyFiles@2
+      displayName: 'Copy timestamp file for later use in the pipeline'
+      inputs:
+        contents: 'TrainTimestamp.txt'
+        targetFolder: '$(Build.ArtifactStagingDirectory)'
+    - publish: '$(Build.ArtifactStagingDirectory)'
+      displayName: 'Publish timestamp file for later use'
+      artifact: scratchpad
+    - bash: |
+        echo "TrainTimestamp is [$(TrainTimestamp)]"   
+      displayName: 'Show results of train timestamp'
+
+- stage: DevTrain
+  displayName: Dev- Generate and publish training data
+  dependsOn: SetTimestamp
+  variables:
+    aksName: 'set in script'
+    aksResourceGroup: 'set in script'
+    namespace: 'set in script'
+    AzureStorageAccount: 'set in script'
+  jobs:  
+  - deployment: Training
+    environment: development
+    displayName: Generate and publish training data
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+          - checkout: scripts
+          - template: pipeline-templates/deployTrainJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-dev-AKSLOWDEVPRV001
+              NAMESPACE: cfo-apps-revpred-dev
+              AZURE_STORAGE_ACCOUNT: revpredtempblobdev
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenDev)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: devresults
+- stage: ProdTrain
+  displayName: Production- Generate and publish training data
+  dependsOn: DevTrain
+  # todo: change build.sourceBranch to resources.pipeline.sourceTrainBuild.sourceBranch for other artifact
+  condition: and(succeeded(), or(eq(variables['resources.pipeline.sourceTrainBuild.sourceBranch'], 'refs/heads/main'),eq(variables['resources.pipeline.sourceTrainBuild.sourceBranch'], 'refs/heads/master')))
+  variables:
+    aksName: 'set in script'
+    aksResourceGroup: 'set in script'
+    namespace: 'set in script'
+    AzureStorageAccount: 'set in script'
+  jobs:  
+  - deployment: Training
+    environment: trainingforproduction
+    displayName: Generate and publish training data
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+          - checkout: scripts
+          - template: pipeline-templates/deployTrainJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-prod-AKSLOWPRODPRV002
+              NAMESPACE: cfo-apps-revpred-prod
+              AZURE_STORAGE_ACCOUNT: revpredtempblob
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenProd)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: prodresults
+
+
+
+
+===========================================================================================================================================================================================
+
+# prod.create-excel-files.sh
+
+#!/bin/bash
+
+curl -H "Content-Type: application/json" -X POST -d '{}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"DS"}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"TAC"}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"IA"}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"India"}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES"}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"Analytics"}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"Communication"}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"Data"}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"Education"}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"Environment"}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"Health"}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"Justice"}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"Technology"}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"SSES","unit":"TRUE"}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"IDG"}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"IDG","unit":"GH"}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"IDG","unit":"Int'"'"'l Ed"}' https://revpred.rti.org/api/excel
+curl -H "Content-Type: application/json" -X POST -d '{"bu":"IDG","unit":"SG&R"}' https://revpred.rti.org/api/excel
+
+
+
+
+===========================================================================================================================================================================================
+
+# README.md
+
+# Introduction 
+TODO: Give a short introduction of your project. Let this section explain the objectives or the motivation behind this project. 
+
+# Getting Started
+TODO: Guide users through getting your code up and running on their own system. In this section you can talk about:
+1.        Installation process
+2.        Software dependencies
+3.        Latest releases
+4.        API references
+
+# Build and Test
+TODO: Describe and show how to build your code and run the tests. 
+
+# Contribute
+TODO: Explain how other users and developers can contribute to make your code better. 
+
+If you want to learn more about creating good readme files then refer the following [guidelines](https://docs.microsoft.com/en-us/azure/devops/repos/git/create-a-readme?view=azure-devops). You can also seek inspiration from the below readme files:
+- [ASP.NET Core](https://github.com/aspnet/Home)
+- [Visual Studio Code](https://github.com/Microsoft/vscode)
+- [Chakra Core](https://github.com/Microsoft/ChakraCore)
+
+===========================================================================================================================================================================================
+
+# RPMStorageDailyPesterTests.ps1
+
+<# 
+.SYNOPSIS 
+This is a powershell script to be run using pester to test if all required storage container blob files are present and have been updated in the past day
+
+.DESCRIPTION 
+run a series of pester tests to determine if daily file updates have occured - the list of containers/files to be checked occurs at the end of the script
+
+.NOTES 
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐ 
+│ ORIGIN STORY                                                                                │ 
+├─────────────────────────────────────────────────────────────────────────────────────────────┤  
+|   DATE        : 2020-12-03
+│   AUTHOR      : K Sheridan 
+│   DESCRIPTION :  
+│   UPDATES     : 2020-12-03     creation
+|                 2021-01-25     added backwards compatibility switch for container locations
+└─────────────────────────────────────────────────────────────────────────────────────────────┘ 
+
+.PARAMETER StorageAccountName 
+The storage account the contaienrs will be checked for
+
+.PARAMETER StorageAccountKey 
+The key to access the named storage account
+
+.PARAMETER extraBlob 
+In order to force failures for error handling tests
+
+.PARAMETER backwardsCompatibility 
+Use "Y" for pre-autotrain storage locations
+
+.EXAMPLE 
+
+Invoke-Pester `
+-Script @{ Path =  'RPMPipeLinePesterTests.ps1'; Parameters = @{StorageAccountName = "revpredtempblobdev"; StorageAccountKey = "$StorageAccountKey"} }  `
+-OutputFile "./Test-Pester.XML" `
+-OutputFormat 'NUnitXML'
+#>
+
+[cmdletbinding()]
+param(
+
+[Parameter(Mandatory)]
+[ValidateNotNullOrEmpty()]
+[string]$StorageAccountName,
+
+
+[Parameter(Mandatory)]
+[ValidateNotNullOrEmpty()]
+[string]$StorageAccountKey,
+
+[Parameter()]
+[string]$backwardsCompatibility,
+
+[Parameter()]
+[string]$extraContainer,
+
+[Parameter()]
+[string]$extraBlob
+)
+
+Function Get-AzBlobList {
+        [cmdletbinding()]
+        Param (
+        $context 
+        )
+
+
+        $contents = Get-AzStorageContainer -context $context
+        $allContents = @()
+        foreach ($storageContainer in $contents) {
+                $blobContents = Get-AzStorageBlob -context $context -container $storageContainer.name
+                foreach ($blob in $blobContents) {
+                        $allContents += [PSCustomObject] @{
+                                AccountName =   $StorageAccountName
+                                ContainerName = $storageContainer.name
+                                BlobName =          $blob.Name             
+                                BlobType =      $blob.BlobType
+                                Length =        $blob.Length  
+                                ContentType =   $blob.ContentType              
+                                LastModified =  $blob.LastModified    
+                                AccessTier =    $blob.AccessTier
+                                SnapshotTime =  $blob.SnapshotTime             
+                                IsDeleted =     $blob.IsDeleted
+                                VersionId =     $blob.VersionId
+                        }
+                }
+        }
+
+        return $allContents
+}
+
+Function Check-StorageContainerPresenceWithoutActualTest {
+    [cmdletbinding()]
+    Param (
+        $list,
+        $context, 
+        [string] $container,
+        [string] $blob,
+        [DateTime] $LastModifiedSince
+    )
+    
+    $nameAndDateConstrainedList = $list | Where-Object { ($_.ContainerName -eq $container) -and ($_.blobName -like $blob) -and ($_.LastModified -gt $LastModifiedSince) }
+    return ($nameAndDateConstrainedList.count -gt 0)
+}
+
+
+Function Test-StorageContainerPresence {
+        [cmdletbinding()]
+        Param (
+        $list,
+        $context, 
+        [string] $container,
+        [string] $blob,
+        [string] $desiredColumns = 'yes',
+        [DateTime] $LastModifiedSince
+        )
+
+        $nameConstrainedList = @($list  | ?{ ( $_.ContainerName -eq  "$container") -and ( $_.blobName -like  "$blob" ) } )
+    $lastConstrainedEntry = $nameConstrainedList | Sort-Object LastModified -Descending | select-object -first 1
+
+        Describe "Container $container has a blob $blob which is not empty and has been updated" {
+                It "Container $container Blob $blob exists" {
+                        $nameConstrainedList.Count | should BeGreaterThan 0 
+                }
+                
+                It "Container $container Blob $blob is of length > 0" {
+                        $lastConstrainedEntry.Length | should BeGreaterThan 0  
+                }
+                
+                It "Container $container Blob $blob is not deleted" {
+                        $lastConstrainedEntry.IsDeleted | should Be False  
+                }
+        
+                if ($LastModifiedSince) {
+
+                        $hoursSince = [math]::Round(([DateTime]::Now - $LastModifiedSince ).TotalHours)     
+            
+                        It "Container $container Blob $blob has been updated in the past $hoursSince hours" {
+                                        $lastConstrainedEntry.LastModified | should  BeGreaterThan $LastModifiedSince  
+            }
+                }
+
+
+
+        if (("$blob" -match ".csv") -and ($desiredColumns) -and ($lastConstrainedEntry)) {
+
+                        $tmp = New-TemporaryFile
+
+                        $testBlobContent = Get-AzStorageBlobContent -context $context -container $lastConstrainedEntry.ContainerName -blob $lastConstrainedEntry.blobName -Destination $tmp.name -force
+
+                        $truncatedtmp = New-TemporaryFile
+
+                        # csv files can be safely truncated, and this REALLY speeds up processing
+                        # we run this twice so column names don't get trimmed for "not having contents" 
+                        $content =  @(Get-Content $tmp.name -first 1)
+                        $content += @(Get-Content $tmp.name -first 1)
+                        $content | Set-Content $truncatedtmp.name
+
+                        $blobcsv = import-csv $truncatedtmp.name
+
+                        if ($blobcsv) {
+                                $blobCsvColumns = ($blobcsv | Get-Member -MemberType Properties | Select-Object -ExpandProperty Name | Select-Object -Unique | %{"`'$_`'"})
+                                $BlobCsvColumnNames = [string]::Join(", ", $blobCsvColumns)
+                        }
+
+                        $lastConstrainedEntry | Add-Member -NotePropertyName CsvColumnNames -NotePropertyValue $BlobCsvColumnNames -force
+
+                        It "Container $container blob $($lastConstrainedEntry.blobName) has column count $($blobCsvColumns.count) should be greater than 0" {
+                                $($blobCsvColumns.count) | should BeGreaterThan 0  
+                        }
+
+                        It "Container $container blob $($lastConstrainedEntry.blobName) has column names: { $($blobCsvColumnNames) } should not be empty" {
+                                $($blobCsvColumnNames) | should not BeNullOrEmpty  
+                        }
+                        
+                        del $tmp.Name
+                        del $truncatedtmp.name
+                }
+
+        }
+    
+    write-verbose "$lastConstrainedEntry"
+    
+        return $lastConstrainedEntry
+}
+
+
+[DateTime] $LastModifiedSince = [DateTime]::Now.AddDays(-1)
+
+# set these in advance so they don't go out of scope
+$context = New-AzStorageContext -StorageAccountName $StorageAccountName -StorageAccountKey $StorageAccountKey
+$allContents = Get-AzBlobList -context $context
+
+Describe "Can access storage account $StorageAccountName" {
+
+        It "Can access storage account $StorageAccountName"  {
+                $context | should not BeNullorEmpty  
+                }
+}
+
+Describe  "Can read content list for storage account $StorageAccountName" {        
+        
+        It "Can read content list for storage account $StorageAccountName"  {
+                $allContents | should not BeNullOrEmpty 
+                }
+        }
+        
+# to check on all files updated in last day, regardless of name:
+#     $allContents | ?{ $_.LastModified -gt $LastModifiedSince } | %{"TestForPresence -container `"$($_.ContainerName)`" -blob `"$($_.BlobName)`""}
+#
+
+# named container files we will check
+$processedStorageContainers = @()
+
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "backlog" -blob "current/daily/backlog.csv"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "opps" -blob "current/daily/opportunity.csv"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "option" -blob "current/daily/optiondetail.csv"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "organization" -blob "actuals.csv"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "organization" -blob "fiscal-period/current/daily/fiscal-periods.csv"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "organization" -blob "historyowningtoplevel.csv"
+
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "training" -blob "model3/current/monthly/training_data.csv"
+
+
+# location of files changed when model 3,4,5 autotrain introduced
+
+if ($backwardsCompatibility -eq "Y") {
+
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model2-output" -blob "Backlog_preds.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model2-output" -blob "Opportunities_preds.csv"
+
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model3-score-output" -blob "*/backlog.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model3-score-output" -blob "backlog.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model3-score-output" -blob "*/opportunities.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model3-score-output" -blob "opportunities.csv"
+   
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model41-score-output" -blob "*/backlog.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model41-score-output" -blob "*/opportunities.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model41-score-output" -blob "backlog.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model41-score-output" -blob "opportunities.csv"
+
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model42-score-output" -blob "*/backlog.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model42-score-output" -blob "*/opportunities.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model42-score-output" -blob "backlog.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model42-score-output" -blob "opportunities.csv"
+
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model42-score-output" -blob "*/backlog.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model42-score-output" -blob "*/opportunities.csv"
+
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model42-score-output" -blob "backlog.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model42-score-output" -blob "opportunities.csv"
+
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model42-score-output" -blob "backlog.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model42-score-output" -blob "opportunities.csv"
+
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "business_unit/DS.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "business_unit/G&A.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "business_unit/IA.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "business_unit/IDG.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "business_unit/India.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "business_unit/SSES.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "business_unit/TAC.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "business_unit/actuals_lag_amount.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "business_unit/estimates_lag_amount.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "business_unit/estimates_lag_count.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "business_unit/estimates_lag_lwa.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "business_unit/forecasted_spreads.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "business_unit/historical_spread_proportions.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "business_unit/idx_spread_weights.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "business_unit/missing_opportunities.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "business_unit/missing_opportunities_predicted_capped.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "m5_output.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/ACP.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/AS.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/CDD.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/CDO.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/COO.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/DS EVP.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/Energy.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/GH.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/Health.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/IA CAS.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/IA Fed.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/ICO.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/IRG Integration.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/ITHC.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/Int'l Ed.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/Office of the President.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/RTI India.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/SG&R.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/SSES VP Office.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/WASH.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/WRM.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/actuals_lag_amount.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/estimates_lag_amount.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/estimates_lag_count.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/estimates_lag_lwa.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/forecasted_spreads.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/historical_spread_proportions.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/idx_spread_weights.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/missing_opportunities.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model5-output" -blob "unit/missing_opportunities_predicted_capped.json"
+
+}
+else {
+
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model2-output" -blob "*Backlog_preds.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "model2-output" -blob "*Opportunities_preds.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model3-score-output" -blob "*/spread/score-output/backlog.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model3-score-output" -blob "*/spread/score-output/opportunities.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model4-score-output" -blob "*/project-income/score-output/backlog.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model4-score-output" -blob "*/project-income/score-output/opportunities.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model4-score-output" -blob "*/spread/score-output/backlog.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model4-score-output" -blob "*/spread/score-output/opportunities.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/business_unit/DS.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/business_unit/G&A.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/business_unit/IA.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/business_unit/IDG.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/business_unit/India.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/business_unit/SSES.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/business_unit/TAC.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/business_unit/actuals_lag_amount.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/business_unit/estimates_lag_amount.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/business_unit/estimates_lag_count.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/business_unit/estimates_lag_lwa.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/business_unit/forecasted_spreads.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/business_unit/historical_spread_proportions.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/business_unit/idx_spread_weights.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/business_unit/missing_opportunities.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/business_unit/missing_opportunities_predicted_capped.json"
+
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/m5_output.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/DS_ACP.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/DS_AS.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/DS_CDD.csv"
+#   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/DS_DS EVP.csv"
+#   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/DS_FP&C.csv"
+
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/G&A_Finance.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/G&A_GTS.csv"
+
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/IA_IA CAS.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/IA_IA Fed.csv"
+   
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/IDG_GH.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/IDG_IDG VP Office.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/IDG_Int'l Ed.csv"
+#   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/IDG_IRG Integration.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/IDG_SG&R.csv"
+
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/India_CDO.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/India_Energy.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/India_Health.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/India_ICO.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/India_RTI India.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/India_WASH.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/India_WRM.csv"
+
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/SSES_Analytics.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/SSES_Communication.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/SSES_Data.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/SSES_Education.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/SSES_Environment.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/SSES_Health.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/SSES_Justice.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/SSES_SSES VP Office.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/SSES_Technology.csv"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/SSES_TRUE.csv"
+
+    
+   
+    
+    # First, check for TAC_TAC.csv; if not found, then check for TAC_TAC VP.csv
+    if (Check-StorageContainerPresenceWithoutActualTest -list $allcontents -context $context -LastModifiedSince $LastModifiedSince -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/TAC_TAC.csv") {
+        $tacTacCheck = Test-StorageContainerPresence -list $allcontents -context $context -lastmodifiedsince $LastModifiedSince -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/TAC_TAC.csv"
+        $processedStorageContainers += $tacTacCheck
+    } else {
+        $tacTacVpCheck = Test-StorageContainerPresence -list $allcontents -context $context -lastmodifiedsince $LastModifiedSince -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/TAC_TAC VP.csv"
+        if ($tacTacVpCheck) {
+            $processedStorageContainers += $tacTacVpCheck
+        }
+    }
+
+
+#Add additional files below once the additional groups are added
+#TAC_BM.csv
+#TAC_DCS.csv
+#TAC_EP.csv
+#TAC_ME.csv
+#TAC_SES.csv
+   
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/actuals_lag_amount.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/estimates_lag_amount.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/estimates_lag_count.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/estimates_lag_lwa.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/forecasted_spreads.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/historical_spread_proportions.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/idx_spread_weights.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/missing_opportunities.json"
+   $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince   -container "autotrain-model5-score-output" -blob "*/spread/score-output/unit/missing_opportunities_predicted_capped.json"   
+}
+
+
+
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (All RTI) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (DS) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (IA) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (IDG - GH) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (IDG - Int'l Ed) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (IDG) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (India) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (IDG - SG&R) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (SSES - Analytics) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (SSES - Communication) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (SSES - Data) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (SSES - Education) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (SSES - Environment) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (SSES - Health) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (SSES - Justice) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (SSES - Technology) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (SSES - TRUE) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (SSES) *.xlsx"
+$processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "excel" -blob "*/Revenue Prediction (TAC) *.xlsx"
+
+# also run for any {container, blob} inserted through parameters.  
+# this is used for failure path testing
+if (($extraBlob) -and ($extraContainer)) {
+        $processedStorageContainers += Test-StorageContainerPresence -list $allcontents -context $context   -lastmodifiedsince $LastModifiedSince  -container "$extraContainer" -blob "$extraBlob"
+}
+# if we want to test for unknown containers showing up, we might check is allContens is same containers as $processedStorageContainers ...
+
+# print out final details to logs of all storage containers processed
+$processedStorageContainers | Sort-Object AccountName,ContainerName,BlobName | format-table -wrap AccountName,ContainerName,BlobName,BlobType,Length,LastModified,IsDeleted
+
+
+===========================================================================================================================================================================================
+
+# training-pipeline-azure.yaml
+
+trigger: 
+ paths:
+  include:
+   - training-pipeline-azure.yml
+ branches:
+  include:
+   - master
+   - develop
+parameters:
+- name: AZURE_MODEL2_OUTPUT_CONTAINER
+  displayName: AZURE_MODEL2_OUTPUT_CONTAINER
+  type: string
+  default: autotrain-model2-output
+- name: AZURE_STORAGE_WORKSPACE_CONTAINER
+  displayName: AZURE_STORAGE_WORKSPACE_CONTAINER
+  type: string
+  default: autotrain-workspace
+schedules:
+- cron: "00 05 01 02,05,08,11 *"
+  displayName: Quarterly at Midnight (EST)
+  branches:
+    include:
+    - master
+  always: true
+# Pipeline triggered by a pipeline
+resources:
+  pipelines:
+   - pipeline: sourcetrainbuild
+     project: "Revenue Prediction"
+     source: "[Build] M1M2 train image"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+  repositories:
+  - repository: scripts
+    type: git
+    name: Revenue Prediction/pipeline scripts
+    ref: master
+variables:
+- group: 'Azure Variables'
+- name: TrainTimestamp
+  value: SetByInitialStage
+- name: TrainImageName
+  value: revenue-prediction-m1-m2-train
+- name: jobName
+  value: model-training
+- name: jobManifest
+  value: model-training-job.yaml
+stages:
+- stage: SetTimestamp
+  displayName: Set the Timestamp for the training data
+  jobs:  
+  - job: Prepare
+    displayName: Prepare
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    steps:
+    - checkout: scripts
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: 'gci env:RESOURCES* | Sort-Object -Property key | format-table -wrap'
+      displayName: 'Display environment'
+    - bash: |
+        TRAIN_TIMESTAMP="$(date +"%Y%m%d%H%M")"
+        # place in a file to be available to future stages
+        echo "${TRAIN_TIMESTAMP}" >  TrainTimestamp.txt
+        # expose timestamp in build variable
+        echo "##vso[task.setvariable variable=TrainTimestamp;]${TRAIN_TIMESTAMP}" 
+      displayName: 'Set training timestamp'
+    - task: CopyFiles@2
+      displayName: 'Copy timestamp file for later use in the pipeline'
+      inputs:
+        contents: 'TrainTimestamp.txt'
+        targetFolder: '$(Build.ArtifactStagingDirectory)'
+    - publish: '$(Build.ArtifactStagingDirectory)'
+      displayName: 'Publish timestamp file for later use'
+      artifact: scratchpad
+    - bash: |
+        echo "TrainTimestamp is [$(TrainTimestamp)]"   
+      displayName: 'Show results of train timestamp'
+
+- stage: DevTrain
+  displayName: Dev- Generate and publish training data
+  dependsOn: SetTimestamp
+  variables:
+    aksName: 'set in script'
+    aksResourceGroup: 'set in script'
+    namespace: 'set in script'
+    AzureStorageAccount: 'set in script'
+  jobs:  
+  - deployment: Training
+    environment: development
+    displayName: Generate and publish training data
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+          - checkout: scripts
+          - template: pipeline-templates/deployTrainJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-dev-AKSLOWDEVPRV001
+              NAMESPACE: cfo-apps-revpred-dev
+              AZURE_STORAGE_ACCOUNT: revpredtempblobdev
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenDev)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: devresults
+- stage: ProdTrain
+  displayName: Production- Generate and publish training data
+  dependsOn: DevTrain
+  # todo: change build.sourceBranch to resources.pipeline.sourceTrainBuild.sourceBranch for other artifact
+  condition: and(succeeded(), or(eq(variables['resources.pipeline.sourceTrainBuild.sourceBranch'], 'refs/heads/main'),eq(variables['resources.pipeline.sourceTrainBuild.sourceBranch'], 'refs/heads/master')))
+  variables:
+    aksName: 'set in script'
+    aksResourceGroup: 'set in script'
+    namespace: 'set in script'
+    AzureStorageAccount: 'set in script'
+  jobs:  
+  - deployment: Training
+    environment: trainingforproduction
+    displayName: Generate and publish training data
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+          - checkout: scripts
+          - template: pipeline-templates/deployTrainJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-prod-AKSLOWPRODPRV002
+              NAMESPACE: cfo-apps-revpred-prod
+              AZURE_STORAGE_ACCOUNT: revpredtempblob
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenProd)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: prodresults
+
+
+
+
+======================================================================================================================================
+======================================================================================================================================
+
+🔎 High-Level Summary
+
+These YAML and shell script files together implement an Azure DevOps CI/CD pipeline for a Revenue Prediction system that:
+
+Prepares environments
+
+Installs required tools (zip, helm, kubelogin, Azure PowerShell modules).
+
+Cleans up Docker images on build agents when needed.
+
+Creates training jobs for machine learning models (M1, M2, M3, M4)
+
+Each training pipeline (training-pipeline-azure.yaml, m3-training-pipeline-azure.yaml, m4-training-pipeline-azure.yaml)
+
+Sets a timestamp to tag training runs.
+
+Runs a Dev AKS job that generates training data and stores results in Azure Blob Storage.
+
+If successful, conditionally runs a Prod AKS job for official production training.
+
+Uses deployTrainJobManifest.yml (not shown but referenced) to deploy a Kubernetes Job manifest to AKS.
+
+Handles artifacts and configuration
+
+Passes variables (like timestamp, storage account, SAS tokens, job manifest) between stages.
+
+Publishes and downloads artifacts (scratchpad timestamp files, training results).
+
+Automates scheduled runs
+
+Quarterly cron schedules trigger retraining on master automatically.
+
+Pipelines also trigger from upstream build pipelines (e.g., model training images being rebuilt).
+
+Generates Excel outputs via APIs
+
+Scripts (dev.create-excel-files.sh, prod.create-excel-files.sh)
+
+Call internal APIs (/api/excel) with different business units (BUs) and sub-units.
+
+Automates the creation of Excel-based reports in dev and prod environments.
+
+Deployment & Job execution flow
+
+YAML pipelines orchestrate job execution on Kubernetes (AKS).
+
+They mount secrets and parameters (service connections, SAS tokens, namespaces).
+
+Jobs run the actual training containers (revenue-prediction-mX-train) to process data.
+
+📌 In Plain Words
+
+This is a full CI/CD system for ML model training and report generation.
+
+Developers commit code → triggers pipelines.
+
+Pipelines build images → training pipelines pick them up.
+
+Training pipelines:
+
+Generate a timestamp,
+
+Launch training jobs on Dev AKS,
+
+If successful, repeat on Prod AKS.
+
+Artifacts and results are stored in Azure Blob Storage.
+
+Excel report scripts call APIs to prepare business-unit–specific reports.
+
+Utility pipelines handle dependencies (install tools, clean images).
+
+Effectively, it ensures that models are retrained quarterly (or on demand), stored properly, and aligned between dev/prod, while Excel reports are generated for different business units automatically.

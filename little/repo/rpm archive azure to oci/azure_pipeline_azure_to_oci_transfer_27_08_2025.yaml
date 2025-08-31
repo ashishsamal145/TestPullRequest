@@ -1,0 +1,180 @@
+# azure-to-oci-daily-extract.yaml
+
+trigger: none
+pool: "msalowgts-devopvmss"
+pr: none
+schedules:
+- cron: "0 12 * * *"
+  displayName: Daily at 7am (UTC)
+  branches:
+    include:
+    - master
+  always: true
+
+# ------------------------------
+# PARAMETERS
+# ------------------------------
+parameters:
+- name: logFrequency
+  type: string
+  default: '100'
+
+# Azure
+- name: azureStorageAccount
+  type: string
+  default: 'mystorageacct'
+- name: azureContainer
+  type: string
+  default: 'revpred-archives'
+- name: azureBlobPrefix
+  type: string
+  default: ''
+- name: azureSasToken
+  type: string
+  default: $(AZURE_CONTAINER_SAS)
+
+# OCI
+- name: ociRegion
+  type: string
+  default: 'us-ashburn-1'
+- name: ociNamespace
+  type: string
+  default: 'idr67sb5tyab'
+- name: ociOutBucket
+  type: string
+  default: 'revpred-archive-uat'
+
+# Working dirs
+- name: downloadDirectory
+  type: string
+  default: 'download/'
+- name: uploadDirectory
+  type: string
+  default: 'upload/'
+
+# OCI Secure Files
+- name: ociCliDestConfigEnv
+  type: string
+  default: $(ociApiConfigDest.secureFilePath)
+- name: ociApiKeyDestEnv
+  type: string
+  default: $(ociApiKeyDest.secureFilePath)
+
+# ------------------------------
+# VARIABLES
+# ------------------------------
+variables:
+  OCI_CLI_HOME: '/home/AzDevOps/.oci'
+  OCI_CLI_BIN: '/home/AzDevOps/bin'
+
+# ------------------------------
+# STAGES
+# ------------------------------
+stages:
+- stage: azure_to_oci
+  jobs:
+  - job: run_transfer
+    timeoutInMinutes: 600
+    steps:
+    # ---- Download OCI secure files ----
+    - task: DownloadSecureFile@1
+      name: ociApiConfigDest
+      inputs:
+        secureFile: 'devops_oci_DEST_api_config_file.txt'
+
+    - task: DownloadSecureFile@1
+      name: ociApiKeyDest
+      inputs:
+        secureFile: 'devops_oci_DEST_api_key.pem'
+
+    # ---- Install CLI Tools ----
+    - task: Bash@3
+      displayName: Install Azure & OCI CLI
+      inputs:
+        targetType: inline
+        script: |
+          if ! command -v az >/dev/null 2>&1; then
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+          if [ ! -f "$OCI_CLI_BIN/oci" ]; then
+            bash -c "$(curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)" -- --accept-all-defaults
+          fi
+          mkdir -p $OCI_CLI_HOME
+          cp -f ${{ parameters.ociCliDestConfigEnv }} $OCI_CLI_HOME/config
+          cp -f $(ociApiKeyDest.secureFilePath) $OCI_CLI_HOME/oci_api_key.pem
+          $OCI_CLI_BIN/oci setup repair-file-permissions --file $OCI_CLI_HOME/config
+          $OCI_CLI_BIN/oci setup repair-file-permissions --file $OCI_CLI_HOME/oci_api_key.pem
+          echo "##vso[task.prependpath]$OCI_CLI_BIN"
+
+    # ---- Main Transfer Logic ----
+    - task: PowerShell@2
+      displayName: Azure -> Local -> OCI Transfer
+      inputs:
+        targetType: inline
+        script: |
+          Install-Module -Name Az.Storage -AllowClobber -Scope CurrentUser -Force
+
+          $downloadDir="${{ parameters.downloadDirectory }}"
+          $uploadDir="${{ parameters.uploadDirectory }}"
+          New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $uploadDir | Out-Null
+
+          # Azure context
+          $ctx = New-AzStorageContext -StorageAccountName "${{ parameters.azureStorageAccount }}" -SasToken "${{ parameters.azureSasToken }}"
+
+          # Get all blobs in container with optional prefix
+          $allBlobs = Get-AzStorageBlob -Container "${{ parameters.azureContainer }}" -Context $ctx `
+                        | Where-Object { $_.Name -like "${{ parameters.azureBlobPrefix }}*" }
+
+          [DateTime]$cutoff = [DateTime]::Now.AddDays(-1)
+          $modifiedBlobs = $allBlobs | Where-Object { $_.LastModified -gt $cutoff }
+
+          Write-Host "Found $($modifiedBlobs.Count) modified blobs in last 24 hrs"
+
+          $counter=0
+          foreach ($blob in $modifiedBlobs) {
+            $counter++
+            $fileName=$blob.Name
+            $downloadPath=Join-Path $downloadDir $fileName
+            $uploadPath=Join-Path $uploadDir $fileName
+
+            Write-Host "[$counter] Processing $fileName"
+
+            # Ensure subdirs exist
+            $dlDir = Split-Path $downloadPath
+            $ulDir = Split-Path $uploadPath
+            if (-not (Test-Path $dlDir)) { New-Item -ItemType Directory -Force -Path $dlDir | Out-Null }
+            if (-not (Test-Path $ulDir)) { New-Item -ItemType Directory -Force -Path $ulDir | Out-Null }
+
+            # Download from Azure
+            Get-AzStorageBlobContent -Container "${{ parameters.azureContainer }}" -Blob $fileName -Destination $downloadPath -Context $ctx -Force
+
+            # Copy to upload dir
+            Copy-Item $downloadPath $uploadPath -Force
+
+            # Upload to OCI
+            oci os object put `
+              --region "${{ parameters.ociRegion }}" `
+              --namespace "${{ parameters.ociNamespace }}" `
+              --bucket-name "${{ parameters.ociOutBucket }}" `
+              --file $uploadPath `
+              --name $fileName `
+              --force
+
+            if ($counter % [int]"${{ parameters.logFrequency }}" -eq 0) {
+              Write-Host "Processed $counter files so far..."
+            }
+          }
+
+    # ---- Cleanup Dirs ----
+    - task: PowerShell@2
+      displayName: Cleanup dirs
+      condition: always()
+      inputs:
+        targetType: inline
+        script: |
+          foreach ($p in @("${{ parameters.downloadDirectory }}","${{ parameters.uploadDirectory }}")) {
+            if (Test-Path $p) { Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue }
+            New-Item -ItemType Directory -Force -Path $p | Out-Null
+          }
+          Write-Host "Cleanup done."

@@ -1,0 +1,120 @@
+#  azure-daily-storage-container-test.yaml
+
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger: none
+pool: "msalowgts-devopvmss"
+pr: none
+schedules:
+- cron: "0 13 * * *"
+  displayName: Daily at 8am (UTC)
+  branches:
+    include:
+    - master
+  always: true
+stages:
+- stage: dev
+  jobs:
+  - job: run_tests
+    steps:
+    - task: AzureCLI@2
+      name: "Execute_Pester_Tests"
+      inputs:
+        azureSubscription: 'cfo-apps-revpred-deploy-dev-AKSLOWDEVPRV001'
+        scriptType: 'pscore'
+        scriptLocation: 'inlineScript'
+        failOnStandardError: false
+        powerShellErrorActionPreference: 'continue'
+        inlineScript: |
+          pwd
+          gci -recurse *
+
+          write-host "Using storage account $(StorageAccountName)"
+          # setup server environment to run azure pester tests
+          if (-not (Get-Module -list 'az.accounts')) {
+            Install-Module az.accounts -Scope CurrentUser -Force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'az.resources'))  {
+            Install-Module az.resources -scope currentuser -force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'az.storage'))  {
+            Install-Module az.storage -scope currentuser -force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'Pester'))  {
+             Install-Module -Name Pester -Force -MaximumVersion 4.99.99 -SkipPublisherCheck 2>&1
+          }
+          Import-Module Pester -MaximumVersion 4.99.99
+          
+          # get the test files
+          $TestFiles=$(get-childitem -path $env:BUILD_SOURCESDIRECTORY -recurse *Test*.ps1).fullname
+          foreach ($TestFile in $TestFiles) {
+            write-host "Executing tests for $TestFile"
+            $VerbosePreference='continue'
+            Invoke-Pester -Script @{ Path=$TestFile; Parameters=@{StorageAccountName = '$(StorageAccountName)'; StorageAccountKey = '$(StorageAccountKey)' ;extraContainer = '$(extraContainer)'; extraBlob ='$(extraBlob)'} }  -OutputFile "./Test-Pester.xml" -OutputFormat 'NUnitXML'
+          }
+          
+          # list results
+          gci .
+
+    -     task: PublishTestResults@2
+          inputs:
+            testResultsFormat: 'NUnit'
+            testResultsFiles: '**/Test-*.xml'
+            failTaskOnFailedTests: true
+            buildConfiguration: 'Development'
+            testRunTitle: 'RPM Storage Tests for $(StorageAccountName) (Dev)'
+- stage: prod
+  dependsOn: []
+  condition: contains(variables['runOnProd'], 'true')
+  jobs:
+  - job: run_tests
+    steps:
+    - task: AzureCLI@2
+      name: "Ensure_AZ_CLI_is_present"
+      inputs:
+        azureSubscription: 'cfo-apps-revpred-deploy-prod-AKSLOWPRODPRV002'
+        scriptType: 'pscore'
+        scriptLocation: 'inlineScript'
+        failOnStandardError: false
+        powerShellErrorActionPreference: 'continue'
+        inlineScript: |
+          pwd
+          gci -recurse *
+
+          write-host "Using storage account $(StorageAccountNameProd)"
+          # setup server environment to run azure pester tests
+          if (-not (Get-Module -list 'az.accounts')) {
+            Install-Module az.accounts -Scope CurrentUser -Force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'az.resources'))  {
+            Install-Module az.resources -scope currentuser -force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'az.storage'))  {
+            Install-Module az.storage -scope currentuser -force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'Pester'))  {
+             Install-Module -Name Pester -Force -MaximumVersion 4.99.99 -SkipPublisherCheck 2>&1
+          }
+          Import-Module Pester -MaximumVersion 4.99.99
+          
+          # get the test files
+          $TestFiles=$(get-childitem -path $env:BUILD_SOURCESDIRECTORY -recurse *Test*.ps1).fullname
+          foreach ($TestFile in $TestFiles) {
+            write-host "Executing tests for $TestFile"
+            $VerbosePreference='continue'
+            Invoke-Pester -Script @{ Path=$TestFile; Parameters=@{StorageAccountName = '$(StorageAccountNameProd)'; StorageAccountKey = '$(StorageAccountKeyProd)'} }  -OutputFile "./Test-Pester.xml" -OutputFormat 'NUnitXML'
+          }
+          
+          # list results
+          gci .
+
+    -     task: PublishTestResults@2
+          inputs:
+            testResultsFormat: 'NUnit'
+            testResultsFiles: '**/Test-*.xml'
+            failTaskOnFailedTests: true
+            buildConfiguration: 'Production'
+            testRunTitle: 'RPM Storage Tests for $(StorageAccountNameProd) (Prod)'

@@ -1,0 +1,454 @@
+#  m3-training-pipeline-azure.yaml
+
+trigger:
+ paths:
+  include:
+   - m3-training-pipeline-azure.yml
+ branches:
+  include:
+   - main
+   - master
+   - develop
+parameters:
+- name: AZURE_MODEL2_OUTPUT_CONTAINER
+  displayName: AZURE_MODEL2_OUTPUT_CONTAINER
+  type: string
+  default: autotrain-model2-output
+- name: AZURE_STORAGE_WORKSPACE_CONTAINER
+  displayName: AZURE_STORAGE_WORKSPACE_CONTAINER
+  type: string
+  default: autotrain-workspace
+schedules:
+- cron: "00 05 01 02,05,08,11 *"
+  displayName: Quarterly at Midnight (EST)
+  branches:
+    include:
+    - master
+  always: true
+# Pipeline triggered by a pipeline
+resources:
+  pipelines:
+   - pipeline: sourcetrainbuild
+     project: "Revenue Prediction"
+     source: "[Build] M3 train image"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+  repositories:
+  - repository: scripts
+    type: git
+    name: Revenue Prediction/pipeline scripts
+    ref: master
+variables:
+- group: 'Azure Variables'
+- name: TrainTimestamp
+  value: SetByInitialStage
+- name: TrainImageName
+  value: revenue-prediction-m3-train
+- name: jobName
+  value: m3-model-training
+- name: jobManifest
+  value: m3-model-training-job.yaml
+stages:
+- stage: SetTimestamp
+  displayName: Set the Timestamp for the training data
+  jobs:  
+  - job: Prepare
+    displayName: Prepare
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    steps:
+    - checkout: scripts
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: 'gci env:RESOURCES* | Sort-Object -Property key | format-table -wrap'
+      displayName: 'Display environment'
+    - bash: |
+        TRAIN_TIMESTAMP="$(date +"%Y%m%d%H%M")"
+        # place in a file to be available to future stages
+        echo "${TRAIN_TIMESTAMP}" >  TrainTimestamp.txt
+        # expose timestamp in build variable
+        echo "##vso[task.setvariable variable=TrainTimestamp;]${TRAIN_TIMESTAMP}" 
+      displayName: 'Set training timestamp'
+    - task: CopyFiles@2
+      displayName: 'Copy timestamp file for later use in the pipeline'
+      inputs:
+        contents: 'TrainTimestamp.txt'
+        targetFolder: '$(Build.ArtifactStagingDirectory)'
+    - publish: '$(Build.ArtifactStagingDirectory)'
+      displayName: 'Publish timestamp file for later use'
+      artifact: scratchpad
+    - bash: |
+        echo "TrainTimestamp is [$(TrainTimestamp)]"   
+      displayName: 'Show results of train timestamp'
+
+- stage: DevTrain
+  displayName: Dev- Generate and publish training data
+  dependsOn: SetTimestamp
+  variables:
+    aksName: 'set in script'
+    aksResourceGroup: 'set in script'
+    namespace: 'set in script'
+    AzureStorageAccount: 'set in script'
+  jobs:  
+  - deployment: Training
+    environment: development
+    displayName: Generate and publish training data
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+          - checkout: scripts
+          - template: pipeline-templates/deployTrainJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-dev-AKSLOWDEVPRV001
+              NAMESPACE: cfo-apps-revpred-dev
+              AZURE_STORAGE_ACCOUNT: revpredtempblobdev
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenDev)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: devresults
+- stage: ProdTrain
+  displayName: Production- Generate and publish training data
+  dependsOn: DevTrain
+  # todo: change build.sourceBranch to resources.pipeline.sourceTrainBuild.sourceBranch for other artifact
+  condition: and(succeeded(), or(eq(variables['resources.pipeline.sourceTrainBuild.sourceBranch'], 'refs/heads/main'),eq(variables['resources.pipeline.sourceTrainBuild.sourceBranch'], 'refs/heads/master')))
+  variables:
+    aksName: 'set in script'
+    aksResourceGroup: 'set in script'
+    namespace: 'set in script'
+    AzureStorageAccount: 'set in script'
+  jobs:  
+  - deployment: Training
+    environment: trainingforproduction
+    displayName: Generate and publish training data
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+          - checkout: scripts
+          - template: pipeline-templates/deployTrainJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-prod-AKSLOWPRODPRV002
+              NAMESPACE: cfo-apps-revpred-prod
+              AZURE_STORAGE_ACCOUNT: revpredtempblob
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenProd)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: prodresults
+
+
+# ===============================================================================================================
+
+# Explanation:----------------------------------------------------------------------------------------------
+
+# # m3-training-pipeline-azure.yaml
+
+
+# 📌 Just a comment – name of the file.
+
+# 🔹 Pipeline Triggers
+# trigger:
+#  paths:
+#   include:
+#    - m3-training-pipeline-azure.yml
+#  branches:
+#   include:
+#    - main
+#    - master
+#    - develop
+
+
+# Defines when the pipeline should run automatically.
+
+# Triggered when:
+
+# A change happens to the file m3-training-pipeline-azure.yml.
+
+# On branches: main, master, or develop.
+
+# 🔹 Parameters (user-supplied / reusable)
+# parameters:
+# - name: AZURE_MODEL2_OUTPUT_CONTAINER
+#   displayName: AZURE_MODEL2_OUTPUT_CONTAINER
+#   type: string
+#   default: autotrain-model2-output
+# - name: AZURE_STORAGE_WORKSPACE_CONTAINER
+#   displayName: AZURE_STORAGE_WORKSPACE_CONTAINER
+#   type: string
+#   default: autotrain-workspace
+
+
+# Declares parameters (like variables, but user-editable).
+
+# AZURE_MODEL2_OUTPUT_CONTAINER → default is autotrain-model2-output.
+
+# AZURE_STORAGE_WORKSPACE_CONTAINER → default is autotrain-workspace.
+
+# 🔹 Schedule (timed run)
+# schedules:
+# - cron: "00 05 01 02,05,08,11 *"
+#   displayName: Quarterly at Midnight (EST)
+#   branches:
+#     include:
+#     - master
+#   always: true
+
+
+# Uses a CRON expression to run quarterly.
+
+# Runs at 05:00 UTC (midnight EST) on the 1st day of February, May, August, and November.
+
+# Only runs on master branch.
+
+# always: true → runs even if no code changes.
+
+# 🔹 External Dependencies
+# resources:
+#   pipelines:
+#    - pipeline: sourcetrainbuild
+#      project: "Revenue Prediction"
+#      source: "[Build] M3 train image"
+#      trigger:
+#       branches:
+#         include:
+#         - develop
+#         - main
+#         - master
+#   repositories:
+#   - repository: scripts
+#     type: git
+#     name: Revenue Prediction/pipeline scripts
+#     ref: master
+
+
+# Pipeline resource:
+
+# sourcetrainbuild → depends on another pipeline named "[Build] M3 train image" in project Revenue Prediction.
+
+# Triggered when that pipeline runs on develop, main, or master.
+
+# Repo resource:
+
+# Adds another Git repo (Revenue Prediction/pipeline scripts).
+
+# Checked out at branch master.
+
+# Used to reuse scripts/templates.
+
+# 🔹 Variables
+# variables:
+# - group: 'Azure Variables'
+# - name: TrainTimestamp
+#   value: SetByInitialStage
+# - name: TrainImageName
+#   value: revenue-prediction-m3-train
+# - name: jobName
+#   value: m3-model-training
+# - name: jobManifest
+#   value: m3-model-training-job.yaml
+
+
+# group: 'Azure Variables' → imports predefined variables from Azure DevOps library.
+
+# TrainTimestamp → placeholder, set later.
+
+# TrainImageName → the name of the Docker image for training.
+
+# jobName → job identifier.
+
+# jobManifest → manifest file used to deploy job to Kubernetes.
+
+# 🔹 Stages
+# Stage 1: SetTimestamp
+# - stage: SetTimestamp
+#   displayName: Set the Timestamp for the training data
+
+
+# Creates a timestamp to tag training data/jobs uniquely.
+
+#   jobs:  
+#   - job: Prepare
+#     displayName: Prepare
+#     timeoutInMinutes: 300
+#     pool: "msalowgts-devopvmss"
+
+
+# Single job called Prepare.
+
+# Max runtime: 300 minutes.
+
+# Runs on pool msalowgts-devopvmss (self-hosted agent).
+
+# Steps inside Prepare
+#     - checkout: scripts
+
+
+# Checks out the scripts repository (from resources above).
+
+#     - task: PowerShell@2
+#       inputs:
+#         targetType: 'inline'
+#         script: 'gci env:RESOURCES* | Sort-Object -Property key | format-table -wrap'
+#       displayName: 'Display environment'
+
+
+# Runs a PowerShell command to list environment variables (RESOURCES*).
+
+# Useful for debugging.
+
+#     - bash: |
+#         TRAIN_TIMESTAMP="$(date +"%Y%m%d%H%M")"
+#         # place in a file to be available to future stages
+#         echo "${TRAIN_TIMESTAMP}" >  TrainTimestamp.txt
+#         # expose timestamp in build variable
+#         echo "##vso[task.setvariable variable=TrainTimestamp;]${TRAIN_TIMESTAMP}" 
+#       displayName: 'Set training timestamp'
+
+
+# Creates a timestamp (YYYYMMDDHHMM).
+
+# Writes it to TrainTimestamp.txt.
+
+# Exposes it as pipeline variable (TrainTimestamp).
+
+#     - task: CopyFiles@2
+#       displayName: 'Copy timestamp file for later use in the pipeline'
+#       inputs:
+#         contents: 'TrainTimestamp.txt'
+#         targetFolder: '$(Build.ArtifactStagingDirectory)'
+
+
+# Copies TrainTimestamp.txt into staging directory.
+
+#     - publish: '$(Build.ArtifactStagingDirectory)'
+#       displayName: 'Publish timestamp file for later use'
+#       artifact: scratchpad
+
+
+# Publishes the file as an artifact called scratchpad, so later stages can download it.
+
+#     - bash: |
+#         echo "TrainTimestamp is [$(TrainTimestamp)]"   
+#       displayName: 'Show results of train timestamp'
+
+
+# Echoes the timestamp for logging.
+
+# Stage 2: DevTrain
+# - stage: DevTrain
+#   displayName: Dev- Generate and publish training data
+#   dependsOn: SetTimestamp
+
+
+# Runs after SetTimestamp.
+
+# Executes training in development environment.
+
+#   variables:
+#     aksName: 'set in script'
+#     aksResourceGroup: 'set in script'
+#     namespace: 'set in script'
+    AzureStorageAccount: 'set in script'
+
+
+Placeholders for Kubernetes cluster/namespace info.
+
+Likely replaced dynamically later.
+
+  jobs:  
+  - deployment: Training
+    environment: development
+    displayName: Generate and publish training data
+
+
+Declares a deployment job named Training.
+
+Target environment: development.
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+          - checkout: scripts
+          - template: pipeline-templates/deployTrainJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-dev-AKSLOWDEVPRV001
+              NAMESPACE: cfo-apps-revpred-dev
+              AZURE_STORAGE_ACCOUNT: revpredtempblobdev
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenDev)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: devresults
+
+
+Runs training by applying a job manifest template.
+
+Deploys to Kubernetes cluster using service connection cfo-apps-revpred-deploy-dev-AKSLOWDEVPRV001.
+
+Uses storage account revpredtempblobdev.
+
+Authenticated using AzureSASTokenDev.
+
+Stores results in container devresults.
+
+Stage 3: ProdTrain
+- stage: ProdTrain
+  displayName: Production- Generate and publish training data
+  dependsOn: DevTrain
+
+
+Runs after DevTrain.
+
+Executes training in production environment.
+
+  condition: and(succeeded(), or(eq(variables['resources.pipeline.sourceTrainBuild.sourceBranch'], 'refs/heads/main'),eq(variables['resources.pipeline.sourceTrainBuild.sourceBranch'], 'refs/heads/master')))
+
+
+Condition: only runs if:
+
+Previous stages succeeded AND
+
+Source branch is main or master.
+
+  jobs:  
+  - deployment: Training
+    environment: trainingforproduction
+    displayName: Generate and publish training data
+
+
+Similar to DevTrain but for production.
+
+          - template: pipeline-templates/deployTrainJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-prod-AKSLOWPRODPRV002
+              NAMESPACE: cfo-apps-revpred-prod
+              AZURE_STORAGE_ACCOUNT: revpredtempblob
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenProd)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: prodresults
+
+
+Deploys training job to production Kubernetes cluster.
+
+Uses production storage account (revpredtempblob).
+
+Saves results in container prodresults.
+
+✅ Summary:
+This pipeline automates M3 model training.
+
+Generates a timestamp for traceability.
+
+Runs training in Dev environment, stores results in Azure blob (devresults).
+
+If successful and on main/master, runs in Prod environment, storing results in prodresults.

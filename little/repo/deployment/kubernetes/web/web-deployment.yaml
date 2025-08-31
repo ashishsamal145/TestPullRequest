@@ -1,0 +1,255 @@
+# web-deployment.yaml
+
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: revpred-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: revpred-web
+  template:
+    metadata:
+      labels:
+        app: revpred-web
+    spec:
+      nodeSelector:
+        "beta.kubernetes.io/os": linux
+      containers:
+      - name: revpred-web
+        # replace latest to selected build for deployment (option in devops kubernetes manifest task)
+        image: rtirevenueprediction.azurecr.io/revenue-prediction:latest
+        # change args for spin & wait forever
+        # command: [ "sh", "-c", "--" ]
+        # args: [ "while true; do sleep 30; done;" ]
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 512Mi
+        ports:
+        - containerPort: 3000
+        imagePullPolicy: Always
+        envFrom:
+        - secretRef:
+            name: revenueprediction-web-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: revpred-web
+  annotations:
+    service.beta.kubernetes.io/azure-dns-label-name: revpred-web-aks
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+spec:
+  ports:
+  - port: 3000
+  selector:
+    app: revpred-web
+  type: LoadBalancer
+  # replace {webStaticIp} in manifest task
+  # static, so it can be routed to from the F5
+  # prod should be 10.196.103.248
+  # dev should be 10.196.103.249
+  loadBalancerIP: {webStaticIp}
+
+
+# Explanation:---------------------------------------------------------------------------
+
+# 1) Deployment (Pod spec for the web app)
+# apiVersion: apps/v1
+
+
+# Uses Kubernetes apps/v1 API for Deployments.
+
+# kind: Deployment
+
+
+# We’re creating a Deployment (manages Pods & ensures desired replicas).
+
+# metadata:
+#   name: revpred-web
+
+
+# The Deployment’s name = revpred-web.
+
+# spec:
+#   replicas: 1
+
+
+# Run 1 replica (single instance of the web app).
+# (You could scale this up later.)
+
+#   selector:
+#     matchLabels:
+#       app: revpred-web
+
+
+# Defines how this Deployment finds its Pods.
+# It will manage Pods with the label app=revpred-web.
+
+#   template:
+#     metadata:
+#       labels:
+#         app: revpred-web
+
+
+# This is the Pod template (what Pods look like).
+# Every Pod created will be labeled app=revpred-web.
+
+#     spec:
+#       nodeSelector:
+#         "beta.kubernetes.io/os": linux
+
+
+# Schedule Pods only on Linux nodes.
+# ⚠️ beta.kubernetes.io/os is deprecated; use kubernetes.io/os: linux.
+
+#       containers:
+#       - name: revpred-web
+
+
+# Define a container named revpred-web inside the Pod.
+
+#         # replace latest to selected build for deployment (option in devops kubernetes manifest task)
+#         image: rtirevenueprediction.azurecr.io/revenue-prediction:latest
+
+
+# Use an image stored in Azure Container Registry (ACR).
+# Currently pinned to latest — comment says DevOps pipeline can replace this with a specific build tag.
+
+#         # change args for spin & wait forever
+#         # command: [ "sh", "-c", "--" ]
+#         # args: [ "while true; do sleep 30; done;" ]
+
+
+# Commented-out debug command.
+# If enabled, it would make the container just “sleep forever” instead of running the app (useful for testing images).
+
+#         resources:
+#           requests:
+#             cpu: 100m
+#             memory: 128Mi
+#           limits:
+#             cpu: 250m
+#             memory: 512Mi
+
+
+# Resource management:
+
+# Request: 0.1 CPU, 128Mi memory (guaranteed minimum).
+
+# Limit: 0.25 CPU, 512Mi memory (max allowed).
+
+#         ports:
+#         - containerPort: 3000
+
+
+# Expose container’s port 3000.
+# This is the port the web service listens on.
+
+#         imagePullPolicy: Always
+
+
+# Always pull the image from ACR (even if cached locally).
+# Ensures latest is always up-to-date.
+
+#         envFrom:
+#         - secretRef:
+#             name: revenueprediction-web-secret
+
+
+# Load environment variables from a Kubernetes Secret named revenueprediction-web-secret.
+# (Secret likely contains API keys, DB creds, etc.)
+
+# ---
+
+
+# YAML document separator — next object.
+
+# 2) Service (expose the web app)
+# apiVersion: v1
+# kind: Service
+
+
+# We’re creating a Service.
+
+# metadata:
+#   name: revpred-web
+
+
+# Service name = revpred-web.
+# This will match the Pod label app=revpred-web.
+
+#   annotations:
+#     service.beta.kubernetes.io/azure-dns-label-name: revpred-web-aks
+#     service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+
+
+# Azure-specific service annotations:
+
+# azure-dns-label-name → assign a DNS name like revpred-web-aks.<region>.cloudapp.azure.com.
+
+# azure-load-balancer-internal: "true" → make this an internal LoadBalancer (only reachable inside the VNet, not public internet).
+
+# spec:
+#   ports:
+#   - port: 3000
+
+
+# Expose port 3000 on the Service.
+# (Clients connect here; Service forwards traffic to Pods.)
+
+#   selector:
+#     app: revpred-web
+
+
+# Send traffic to Pods with the label app=revpred-web (set in Deployment).
+
+#   type: LoadBalancer
+
+
+# Expose the Service using a cloud LoadBalancer (Azure Load Balancer in AKS).
+
+#   # replace {webStaticIp} in manifest task
+#   # static, so it can be routed to from the F5
+#   # prod should be 10.196.103.248
+#   # dev should be 10.196.103.249
+#   loadBalancerIP: {webStaticIp}
+
+
+# Assign a static IP (reserved in Azure) for the LoadBalancer.
+# Different IPs are used in prod vs dev.
+# This ensures F5 (or other infra) can always route to the same IP.
+
+# 🚀 Summary
+
+# This file defines:
+
+# Deployment (revpred-web)
+
+# Runs one replica of the revenue prediction web app.
+
+# Uses a container from Azure Container Registry.
+
+# Listens on port 3000.
+
+# Uses secrets for configuration.
+
+# Requests minimal CPU/memory, limits to avoid overuse.
+
+# Runs only on Linux nodes.
+
+# Service (revpred-web)
+
+# Type = LoadBalancer.
+
+# Exposes port 3000 via Azure internal Load Balancer.
+
+# Uses a static private IP so external infra (e.g., F5) can route reliably.
+
+# Gets an Azure DNS label for service discovery.
