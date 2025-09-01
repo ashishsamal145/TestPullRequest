@@ -1,0 +1,1642 @@
+# training-pipeline-azure.yaml
+
+trigger: 
+ paths:
+  include:
+   - training-pipeline-azure.yml
+ branches:
+  include:
+   - master
+   - develop
+parameters:
+- name: AZURE_MODEL2_OUTPUT_CONTAINER
+  displayName: AZURE_MODEL2_OUTPUT_CONTAINER
+  type: string
+  default: autotrain-model2-output
+- name: AZURE_STORAGE_WORKSPACE_CONTAINER
+  displayName: AZURE_STORAGE_WORKSPACE_CONTAINER
+  type: string
+  default: autotrain-workspace
+schedules:
+- cron: "00 05 01 02,05,08,11 *"
+  displayName: Quarterly at Midnight (EST)
+  branches:
+    include:
+    - master
+  always: true
+# Pipeline triggered by a pipeline
+resources:
+  pipelines:
+   - pipeline: sourcetrainbuild
+     project: "Revenue Prediction"
+     source: "[Build] M1M2 train image"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+  repositories:
+  - repository: scripts
+    type: git
+    name: Revenue Prediction/pipeline scripts
+    ref: master
+variables:
+- group: 'Azure Variables'
+- name: TrainTimestamp
+  value: SetByInitialStage
+- name: TrainImageName
+  value: revenue-prediction-m1-m2-train
+- name: jobName
+  value: model-training
+- name: jobManifest
+  value: model-training-job.yaml
+stages:
+- stage: SetTimestamp
+  displayName: Set the Timestamp for the training data
+  jobs:  
+  - job: Prepare
+    displayName: Prepare
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    steps:
+    - checkout: scripts
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: 'gci env:RESOURCES* | Sort-Object -Property key | format-table -wrap'
+      displayName: 'Display environment'
+    - bash: |
+        TRAIN_TIMESTAMP="$(date +"%Y%m%d%H%M")"
+        # place in a file to be available to future stages
+        echo "${TRAIN_TIMESTAMP}" >  TrainTimestamp.txt
+        # expose timestamp in build variable
+        echo "##vso[task.setvariable variable=TrainTimestamp;]${TRAIN_TIMESTAMP}" 
+      displayName: 'Set training timestamp'
+    - task: CopyFiles@2
+      displayName: 'Copy timestamp file for later use in the pipeline'
+      inputs:
+        contents: 'TrainTimestamp.txt'
+        targetFolder: '$(Build.ArtifactStagingDirectory)'
+    - publish: '$(Build.ArtifactStagingDirectory)'
+      displayName: 'Publish timestamp file for later use'
+      artifact: scratchpad
+    - bash: |
+        echo "TrainTimestamp is [$(TrainTimestamp)]"   
+      displayName: 'Show results of train timestamp'
+
+- stage: DevTrain
+  displayName: Dev- Generate and publish training data
+  dependsOn: SetTimestamp
+  variables:
+    aksName: 'set in script'
+    aksResourceGroup: 'set in script'
+    namespace: 'set in script'
+    AzureStorageAccount: 'set in script'
+  jobs:  
+  - deployment: Training
+    environment: development
+    displayName: Generate and publish training data
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+          - checkout: scripts
+          - template: pipeline-templates/deployTrainJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-dev-AKSLOWDEVPRV001
+              NAMESPACE: cfo-apps-revpred-dev
+              AZURE_STORAGE_ACCOUNT: revpredtempblobdev
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenDev)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: devresults
+- stage: ProdTrain
+  displayName: Production- Generate and publish training data
+  dependsOn: DevTrain
+  # todo: change build.sourceBranch to resources.pipeline.sourceTrainBuild.sourceBranch for other artifact
+  condition: and(succeeded(), or(eq(variables['resources.pipeline.sourceTrainBuild.sourceBranch'], 'refs/heads/main'),eq(variables['resources.pipeline.sourceTrainBuild.sourceBranch'], 'refs/heads/master')))
+  variables:
+    aksName: 'set in script'
+    aksResourceGroup: 'set in script'
+    namespace: 'set in script'
+    AzureStorageAccount: 'set in script'
+  jobs:  
+  - deployment: Training
+    environment: trainingforproduction
+    displayName: Generate and publish training data
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+          - checkout: scripts
+          - template: pipeline-templates/deployTrainJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-prod-AKSLOWPRODPRV002
+              NAMESPACE: cfo-apps-revpred-prod
+              AZURE_STORAGE_ACCOUNT: revpredtempblob
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenProd)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: prodresults
+
+=============================================================================================================================================================================================
+
+Explanation:---------------------------------------------------------------------------------------------
+
+Short summary first: this is an Azure DevOps multi-stage pipeline that creates a timestamp, runs a dev training job (by applying a Kubernetes Job manifest template into a dev AKS cluster), and — if the earlier steps succeed and the build source is main/master — repeats the same in prod. Below I walk through each line/statement and explain what it does.
+
+# training-pipeline-azure.yaml
+
+
+Comment/filename — not executed.
+
+trigger: 
+ paths:
+  include:
+   - training-pipeline-azure.yml
+ branches:
+  include:
+   - master
+   - develop
+
+
+trigger: — configures CI triggers.
+
+paths: / include: - training-pipeline-azure.yml — only changes under that path/file will trigger the pipeline.
+
+branches: / include: - master, - develop — triggers are limited to commits on master and develop branches.
+
+=============================================================================================================================================================================================
+
+parameters:
+- name: AZURE_MODEL2_OUTPUT_CONTAINER
+  displayName: AZURE_MODEL2_OUTPUT_CONTAINER
+  type: string
+  default: autotrain-model2-output
+- name: AZURE_STORAGE_WORKSPACE_CONTAINER
+  displayName: AZURE_STORAGE_WORKSPACE_CONTAINER
+  type: string
+  default: autotrain-workspace
+
+
+parameters: — runtime/configurable inputs to the pipeline.
+
+First parameter AZURE_MODEL2_OUTPUT_CONTAINER:
+
+displayName is what shows in the UI, type: string, default value autotrain-model2-output.
+
+Second parameter AZURE_STORAGE_WORKSPACE_CONTAINER:
+
+similar, default autotrain-workspace.
+
+These let you override which Azure blob containers the pipeline will use when you queue the run.
+=============================================================================================================================================================================================
+
+schedules:
+- cron: "00 05 01 02,05,08,11 *"
+  displayName: Quarterly at Midnight (EST)
+  branches:
+    include:
+    - master
+  always: true
+
+
+schedules: defines a scheduled (cron) run.
+
+cron: "00 05 01 02,05,08,11 *" — cron expression: minute 00, hour 05 UTC, day 01 of months 02,05,08,11 (Feb/May/Aug/Nov). That corresponds to midnight Eastern Standard Time when EST is UTC−5 (note DST considerations).
+
+displayName is just a label.
+
+branches.include: - master — schedule runs only against master.
+
+always: true — run even if there are no code changes.
+=============================================================================================================================================================================================
+
+# Pipeline triggered by a pipeline
+resources:
+  pipelines:
+   - pipeline: sourcetrainbuild
+     project: "Revenue Prediction"
+     source: "[Build] M1M2 train image"
+     trigger:
+      branches:
+        include:
+        - develop
+        - main
+        - master
+
+
+resources.pipelines declares a pipeline resource dependency named sourcetrainbuild.
+
+project: "Revenue Prediction" and source: "[Build] M1M2 train image" tell DevOps which pipeline artifact to consume.
+
+trigger.branches.include lists branches of that upstream pipeline that should trigger this pipeline resource (so changes/builds in the source pipeline can kick this pipeline).
+=============================================================================================================================================================================================
+
+  repositories:
+  - repository: scripts
+    type: git
+    name: Revenue Prediction/pipeline scripts
+    ref: master
+
+
+This is adding an extra Git repository into the pipeline (besides the repo where the pipeline YAML itself lives).
+
+repository: scripts → This is the alias you will use inside the pipeline (checkout: scripts).
+
+type: git → It’s a Git repo inside Azure Repos Git (not GitHub or Bitbucket).
+
+name: Revenue Prediction/pipeline scripts → The path to the repo in your Azure DevOps project.
+
+Revenue Prediction = project name
+
+pipeline scripts = repository name
+
+ref: master → Always use the master branch of that repo.
+
+🔹 How it’s used later:
+
+In your pipeline, you see:
+
+- checkout: scripts
+
+
+→ This checks out that external repo’s contents into the pipeline workspace.
+
+Also, the templates you call:
+
+- template: pipeline-templates/deployTrainJobManifest.yml
+
+
+are likely stored inside this pipeline scripts repo.
+
+👉 So basically:
+This section pulls in a shared scripts/templates repo so that multiple pipelines can reuse the same deployment logic instead of duplicating YAML.
+
+=============================================================================================================================================================================================
+
+variables:
+- group: 'Azure Variables'
+- name: TrainTimestamp
+  value: SetByInitialStage
+- name: TrainImageName
+  value: revenue-prediction-m1-m2-train
+- name: jobName
+  value: model-training
+- name: jobManifest
+  value: model-training-job.yaml
+
+
+variables: defines pipeline variables.
+
+- group: 'Azure Variables' imports a variable group from the Library (typically secrets, tokens, service connections).
+
+TrainTimestamp placeholder SetByInitialStage (will be set later).
+
+TrainImageName is the base Docker image name for the training container.
+
+jobName is a short identifier used elsewhere (e.g., secret/configmap names).
+
+jobManifest is the filename of the Kubernetes Job manifest template to apply.
+
+=============================================================================================================================================================================================
+
+
+Stage: SetTimestamp — create a timestamp and publish it as an artifact
+stages:
+- stage: SetTimestamp
+  displayName: Set the Timestamp for the training data
+
+
+Starts a stages block. First stage named SetTimestamp with a display label.
+
+=============================================================================================================================================================================================
+
+
+  jobs:  
+  - job: Prepare
+    displayName: Prepare
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+
+
+One job inside the stage called Prepare.
+
+timeoutInMinutes: 300 — limit to 5 hours.
+
+pool: "msalowgts-devopvmss" — which agent pool to run on (self-hosted).
+
+=============================================================================================================================================================================================
+
+    steps:
+    - checkout: scripts
+
+
+steps: begins the job steps.
+
+Pulls in the external repo (Revenue Prediction/pipeline scripts).
+
+Ensures scripts/templates are available in this job.
+
+- checkout: scripts — checks out the scripts repository declared in resources so templates or helper scripts are available.
+
+=============================================================================================================================================================================================
+
+
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: 'gci env:RESOURCES* | Sort-Object -Property key | format-table -wrap'
+      displayName: 'Display environment'
+
+
+Runs a PowerShell task that lists environment variables starting with RESOURCES* — purely diagnostic/helpful for debugging.
+
+=============================================================================================================================================================================================
+
+
+    - bash: |
+        TRAIN_TIMESTAMP="$(date +"%Y%m%d%H%M")"
+        # place in a file to be available to future stages
+        echo "${TRAIN_TIMESTAMP}" >  TrainTimestamp.txt
+        # expose timestamp in build variable
+        echo "##vso[task.setvariable variable=TrainTimestamp;]${TRAIN_TIMESTAMP}" 
+      displayName: 'Set training timestamp'
+
+
+Runs a Bash inline script:
+
+TRAIN_TIMESTAMP="$(date +"%Y%m%d%H%M")" — creates a timestamp string YYYYMMDDHHMM.
+
+Writes it into TrainTimestamp.txt so other stages can pick it up as an artifact.
+
+Uses the Azure DevOps logging command ##vso[task.setvariable ...] to set the pipeline variable TrainTimestamp for subsequent steps/stages.
+
+displayName labels the step.
+
+=============================================================================================================================================================================================
+
+
+    - task: CopyFiles@2
+      displayName: 'Copy timestamp file for later use in the pipeline'
+      inputs:
+        contents: 'TrainTimestamp.txt'
+        targetFolder: '$(Build.ArtifactStagingDirectory)'
+
+
+Copies TrainTimestamp.txt into the build artifact staging directory, preparing it for publish.
+
+=============================================================================================================================================================================================
+
+    - publish: '$(Build.ArtifactStagingDirectory)'
+      displayName: 'Publish timestamp file for later use'
+      artifact: scratchpad
+
+
+Publishes contents of the staging directory as a pipeline artifact named scratchpad. Later stages will download this artifact to retrieve the timestamp file.
+
+=============================================================================================================================================================================================
+
+    - bash: |
+        echo "TrainTimestamp is [$(TrainTimestamp)]"   
+      displayName: 'Show results of train timestamp'
+
+
+Echoes the variable for logging and verification.
+
+=============================================================================================================================================================================================
+
+Stage: DevTrain — deploy the training job into development AKS
+- stage: DevTrain
+  displayName: Dev- Generate and publish training data
+  dependsOn: SetTimestamp
+
+
+Stage DevTrain which depends on completion of SetTimestamp.
+
+=============================================================================================================================================================================================
+
+
+  variables:
+    aksName: 'set in script'
+    aksResourceGroup: 'set in script'
+    namespace: 'set in script'
+    AzureStorageAccount: 'set in script'
+
+
+Stage-scoped placeholders for cluster/namespace/storage values (they will be set/used inside templates or scripts).
+
+These are placeholders for values that will be dynamically set (likely inside the deployment template).
+
+Examples:
+
+aksName → AKS (Azure Kubernetes Service) cluster name
+
+aksResourceGroup → resource group for the AKS cluster
+
+namespace → Kubernetes namespace where training job runs
+
+AzureStorageAccount → Azure storage account used for training outputs
+
+=============================================================================================================================================================================================
+
+
+  jobs:  
+  - deployment: Training
+    environment: development
+    displayName: Generate and publish training data
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+
+
+A deployment job type named Training.
+
+environment: development ties it to a DevOps environment (for approvals/visibility).
+
+Uses same agent pool and timeout.
+
+This is a deployment job named Training.
+
+Runs against the development environment in Azure DevOps (so approvals & checks can apply).
+
+timeoutInMinutes: 300 → can run up to 5 hours (training jobs can be long).
+
+Uses the same custom agent pool (msalowgts-devopvmss).
+
+=============================================================================================================================================================================================
+
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+          - checkout: scripts
+
+
+strategy.runOnce.deploy.steps — the steps to execute as a single deploy action.
+
+First step: checkout: scripts — ensures scripts repo available inside this job.
+
+Uses a runOnce deployment strategy (single run, no rolling updates etc. like in multi-stage deployment strategies).
+
+Inside deploy → steps → defines what happens during the deployment.
+
+=============================================================================================================================================================================================
+
+
+
+          - template: pipeline-templates/deployTrainJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-dev-AKSLOWDEVPRV001
+              NAMESPACE: cfo-apps-revpred-dev
+              AZURE_STORAGE_ACCOUNT: revpredtempblobdev
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenDev)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: devresults
+
+
+Includes a reusable template deployTrainJobManifest.yml from pipeline-templates folder.
+
+Passes parameters into the template:
+
+DEPLOYMENT_SERVICE_CONNECTION — the Azure service connection to use for kubectl/aks access (dev).
+
+NAMESPACE — Kubernetes namespace cfo-apps-revpred-dev.
+
+AZURE_STORAGE_ACCOUNT — temp storage account for dev revpredtempblobdev.
+
+AZURE_STORAGE_ACCOUNT_SAS_TOKEN — SAS token variable $(AzureSASTokenDev) pulled from library/variables.
+
+AZURE_MODEL2_OUTPUT_CONTAINER and AZURE_STORAGE_WORKSPACE_CONTAINER are passed through from the top-level parameters.
+
+ARTIFACT_NAME: devresults — name under which the job will publish its results/artifacts.
+
+Effect: the template will create/update Kubernetes secrets/configmaps and kubectl apply the job manifest (using jobManifest) to run the training job on the dev AKS cluster.
+
+=============================================================================================================================================================================================
+
+Stage: ProdTrain — conditionally deploy to production
+- stage: ProdTrain
+  displayName: Production- Generate and publish training data
+  dependsOn: DevTrain
+
+
+ProdTrain runs after DevTrain.
+
+  # todo: change build.sourceBranch to resources.pipeline.sourceTrainBuild.sourceBranch for other artifact
+  condition: and(succeeded(), or(eq(variables['resources.pipeline.sourceTrainBuild.sourceBranch'], 'refs/heads/main'),eq(variables['resources.pipeline.sourceTrainBuild.sourceBranch'], 'refs/heads/master')))
+
+
+condition: ensures this stage runs only if:
+
+the pipeline so far succeeded(), and
+
+the sourceTrainBuild pipeline (resource) was run from refs/heads/main or refs/heads/master.
+
+Comment notes a TODO to adjust a specific variable naming for clarity/consistency.
+
+  variables:
+    aksName: 'set in script'
+    aksResourceGroup: 'set in script'
+    namespace: 'set in script'
+    AzureStorageAccount: 'set in script'
+
+
+Same placeholders for production stage.
+
+  jobs:  
+  - deployment: Training
+    environment: trainingforproduction
+    displayName: Generate and publish training data
+    timeoutInMinutes: 300
+    pool: "msalowgts-devopvmss"
+
+
+deployment job for production environment trainingforproduction. Timeout and pool same as before.
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:  
+          - checkout: scripts
+
+
+Same runOnce strategy; checks out scripts.
+
+          - template: pipeline-templates/deployTrainJobManifest.yml
+            parameters:
+              DEPLOYMENT_SERVICE_CONNECTION: cfo-apps-revpred-deploy-prod-AKSLOWPRODPRV002
+              NAMESPACE: cfo-apps-revpred-prod
+              AZURE_STORAGE_ACCOUNT: revpredtempblob
+              AZURE_STORAGE_ACCOUNT_SAS_TOKEN: $(AzureSASTokenProd)
+              AZURE_MODEL2_OUTPUT_CONTAINER: '${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              AZURE_STORAGE_WORKSPACE_CONTAINER: '${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+              ARTIFACT_NAME: prodresults
+
+
+Calls the same template but with production parameters:
+
+Prod Azure service connection, namespace, storage account, SAS token.
+
+ARTIFACT_NAME: prodresults — the job will publish output under prodresults.
+
+Effect: if the dev training succeeded and the upstream build was from main/master, this stage will apply the training job manifest onto the production AKS cluster and produce production artifacts.
+
+Final notes, gotchas and tips
+
+Trigger path vs filename: The trigger.paths.include references training-pipeline-azure.yml (lower-case .yml) — make sure the actual filename matches, otherwise triggers won't fire.
+
+Cron timezone: Cron is specified in UTC. The display says EST — verify DST handling and intended zone.
+
+Artifacts: The scratchpad artifact produced in SetTimestamp is how the timestamp is passed to downstream jobs — make sure the deployTrainJobManifest.yml template expects to find the timestamp (it usually downloads artifacts inside).
+
+Templates: The heavy lifting (kubectl, secret/configmap creation, kubectl apply) is inside pipeline-templates/deployTrainJobManifest.yml. That template must accept the parameters shown and create secrets/configmaps and apply the job manifest jobManifest.
+
+Conditional Prod deploy: The ProdTrain stage only runs if the source pipeline/build came from main or master — this prevents accidental production runs from feature branches.
+
+Timeouts: All jobs have a 300-minute timeout — training jobs can run long; adjust if needed.
+
+=============================================================================================================================================================
+=============================================================================================================================================================
+=============================================================================================================================================================
+
+#  deployTrainJobManifest.yaml
+
+# job variables from pipeline
+#        $(jobName)
+#        $(jobManifest)
+#
+
+parameters:
+  DEPLOYMENT_SERVICE_CONNECTION: 'NOT_DEFINE'
+  NAMESPACE: 'NOT_DEFINE'
+  AZURE_STORAGE_ACCOUNT: 'NOT_DEFINE'
+  AZURE_STORAGE_ACCOUNT_SAS_TOKEN: 'NOT_DEFINE'
+  ARTIFACT_NAME: 'NOT_DEFINE'
+  AZURE_MODEL2_OUTPUT_CONTAINER: 'NOT_DEFINE'
+  AZURE_STORAGE_WORKSPACE_CONTAINER: 'NOT_DEFINE'
+
+steps:  
+          - download: current
+            artifact: scratchpad
+          - bash: |
+              TRAIN_TIMESTAMP=$(<'$(Pipeline.Workspace)/scratchpad/TrainTimestamp.txt') 
+              # expose timestamp in build variable
+              echo "##vso[task.setvariable variable=TrainTimestamp;]${TRAIN_TIMESTAMP}"
+            
+            displayName: 'Read training timestamp'
+
+          - bash: |
+              echo "TrainTimestamp is [$(TrainTimestamp)]"   
+            displayName: 'Show results of train timestamp'
+          
+          - template: updateInstalls.yml  # Template reference
+
+          - task: AzureCLI@2
+            displayName: Get storage account name
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}' 
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              addSpnToEnvironment: true
+              inlineScript: |
+
+                 gci -recurse * | select directory, name
+
+                 gci env: |  where Name -notmatch token | format-table -wrap
+
+                 write-output "Image name is $(TrainImageName):$(resources.pipeline.sourcetrainbuild.runName)"
+                 
+                 $storageAccounts=(az resource list -o json | convertfrom-json) | where type -eq "Microsoft.Storage/storageAccounts"
+                 $storageAccounts | format-table
+                 $AzureStorageAccount='${{parameters.AZURE_STORAGE_ACCOUNT}}'
+                 # if a specific storage account was not specified, take the storage account from the service connection
+                 if ($AzureStorageAccount -eq 'NOT_DEFINE') {
+                    $AzureStorageAccount = ($storageAccounts | select -First 1).name                   
+                    }
+                 Write-Host "##vso[task.setvariable variable=AzureStorageAccount;]$AzureStorageAccount"
+                 Write-host "using storage account $AzureStorageAccount"
+
+          - powershell: |
+              $AZURE_STORAGE_OUTPUT_CONTAINER='${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+              $AZURE_STORAGE_WORKSPACE_CONTAINER='${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+
+              write-output 'storage account is $(AzureStorageAccount)'
+              write-output "AZURE_STORAGE_OUTPUT_CONTAINER=$AZURE_STORAGE_OUTPUT_CONTAINER"
+              write-output "AZURE_STORAGE_WORKSPACE_CONTAINER=$AZURE_STORAGE_WORKSPACE_CONTAINER "
+
+              # set up storage containers
+              $context = New-AzStorageContext -StorageAccountName '$(AzureStorageAccount)' -SasToken '${{parameters.AZURE_STORAGE_ACCOUNT_SAS_TOKEN}}'
+              $contents = Get-AZStorageContainer -context $context
+            
+              if (-not ( $contents | where name -eq $AZURE_STORAGE_OUTPUT_CONTAINER)) {
+                 New-AzStorageContainer -context $context -name $AZURE_STORAGE_OUTPUT_CONTAINER  -Permission Container
+              }
+              if (-not ( $contents | where name -eq $AZURE_STORAGE_WORKSPACE_CONTAINER)) {
+                New-AzStorageContainer -context $context -name $AZURE_STORAGE_WORKSPACE_CONTAINER -Permission Container
+              }
+            
+              # create a manifest which reflects the correct build
+
+              (gc 'deployment/kubernetes/$(jobManifest)').replace('{TRAIN_TIMESTAMP}','$(TrainTimestamp)').replace('$(TrainImageName):latest','$(TrainImageName):$(resources.pipeline.sourcetrainbuild.runName)') `
+                  > $(Build.ArtifactStagingDirectory)/$(jobManifest)
+            
+              gc $(Build.ArtifactStagingDirectory)/$(jobManifest)
+
+            displayName: 'Prepare to run training through aks'
+
+          - task: PowerShell@2
+            displayName: 'Check Environment variables'
+            inputs:
+                targetType: 'inline'
+                script: |
+                  # Write your PowerShell commands here.
+                      
+                  gci env: | format-table -wrap
+                  gci  -recurse | select fullname
+          
+          - task: AzureCLI@2
+            displayName: Get aks cluster name
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              addSpnToEnvironment: true
+              inlineScript: |
+                # we arent using az aks list anymore as it's not working consistently in al environments
+                $resources = az resource list -o json | convertfrom-json       
+                $aksList = $resources | where 'type' -eq 'Microsoft.ContainerService/managedClusters'
+                $aksList | format-table
+                $aksName='$(aksName)'
+                $aksResourceGroup='$(aksResourceGroup)'
+                # use specific aks is named, otherwise derive from service connection permissions
+                if (('set in script' -eq $aksResourceGroup) -or ('set in script' -eq $aksName))
+                {
+                  write-host "Setting aks from service connection environment"
+                  $aksName = ($aksList | select -First 1).name
+                  $aksResourceGroup= ($aksList | select -First 1).resourceGroup
+                }
+                Write-host "using aks $aksName resource group $aksResourceGroup "
+                Write-Host "##vso[task.setvariable variable=aksName;]$aksName"
+                Write-Host "##vso[task.setvariable variable=aksResourceGroup;]$aksResourceGroup"  
+          
+          - task: AzureCLI@2
+            displayName: use kubelogin to connect
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+
+                Write-host "using aks $(aksName) resource group $(aksResourceGroup)"
+                rm -f ".kube/config" &&  az aks get-credentials --resource-group '$(aksResourceGroup)' \
+                      --name '$(aksName)' \
+                      --overwrite-existing 
+
+                kubelogin convert-kubeconfig -l azurecli
+
+                kubectl config set-context --current --namespace '${{parameters.NAMESPACE}}'
+
+                kubectl get pods 2>&1
+
+          - task: AzureCLI@2
+            displayName: apply manifest
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+              scriptType: 'pscore'
+              powerShellErrorActionPreference: continue
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                
+                kubectl delete secret         $(jobName)-secret  2>&1 | Out-Null
+                kubectl create secret generic $(jobName)-secret --from-literal=AZURE_SAS_TOKEN='${{parameters.AZURE_STORAGE_ACCOUNT_SAS_TOKEN}}'
+
+                kubectl delete configmap      $(jobName)-config  2>&1 | Out-Null
+                kubectl create configmap      $(jobName)-config --from-literal=AZURE_STORAGE_ACCOUNT=$(AzureStorageAccount) `
+                                                                    --from-literal=WORKSPACE=azure `
+                                                                    --from-literal=AZURE_MODEL2_OUTPUT_CONTAINER=${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}} `
+                                                                    --from-literal=AZURE_STORAGE_WORKSPACE_CONTAINER=${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}
+
+                # because this is a job, not a deployment, we do not have to do the "kubectl rollout restart"
+                kubectl apply -f  $(Build.ArtifactStagingDirectory)/$(jobManifest)
+              
+                # outputFormat: yaml
+          - task: AzureCLI@2
+            displayName: 'Check job progress'
+            inputs:
+              azureSubscription: '${{parameters.DEPLOYMENT_SERVICE_CONNECTION}}'
+              scriptType: 'pscore'
+              powerShellErrorActionPreference: continue
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # this step replaces the "wait" function in the kubernetes task, which is not
+                # working properly for extremely long runnign jobs..
+                write-host "kubernetes resources available:"
+
+                #for the logs
+                kubectl get pods  2>&1 
+                kubectl get jobs  2>&1
+                kubectl get services  2>&1
+
+                # there may be more than one job, scope to just the one this pipeline cares about
+                $jobname = "$(jobName)-sequenced-job-$(TrainTimestamp)"
+                
+                  try {
+                      $podSpec = kubectl get pods --selector=job-name=$jobname  -o json 2> $null | convertfrom-json
+                      $podname = $podspec.items[0].metadata.name
+                  }  
+                      catch {}
+                
+                $completionTime=$null
+                $logs=""
+                $Failed = $false
+                while (-not $failed -and $podName -and -not $completionTime) {
+                
+                  $jobSpec = kubectl get jobs  --selector=job-name=$jobname  -o json 2> $null | convertfrom-json
+                  $completionTime = $jobspec.items[0].status.completionTime
+                  $success=$jobspec.items[0].status.succeeded
+                  $initFailed= ($pods.items | select -First 1).status.initContainerStatuses | where .state.reason -match 'Error' 
+                  $failed= (($job.status.conditions.type -eq 'Failed') -or $initFailed)
+
+                  $previouslogs = $logs
+                  $logs= kubectl logs $podname  --all-containers --timestamps  2> $null
+                  if ($logs -eq $null) { $logs=""}
+                  compare-object -PassThru $previouslogs $logs
+                
+                  if (-not   $completionTime) {
+                      write-output "waiting for job $jobname to complete..."
+                      sleep 60
+                  }
+                }
+                
+                if (-not $podname) {
+                    write-output("No pods found for job $jobname")
+                    exit 1
+                    }
+                
+                $logs > "$(Build.ArtifactStagingDirectory)/$($jobname).logs"
+                
+                if (-not ( $success -gt 0 )) {
+                    write-output("Job $jobname failed")
+                    exit 1
+                    }
+                  
+                  write-output("Job $jobname succeeded")
+                
+                  exit 0
+
+
+          - bash: |
+              # place production train timestamp in a file to be available to future stages
+              echo "$(TrainTimestamp)" >  TrainTimestamp.txt
+              echo "Branch is $(resources.pipeline.sourcetrainbuild.sourceBranch)"
+            displayName: 'record production train timestamp'
+          - task: CopyFiles@2
+            displayName: 'Copy final production timestamp file for use by other pipelines'
+            inputs:
+              contents: 'TrainTimestamp.txt'
+              targetFolder: '$(Build.ArtifactStagingDirectory)'
+          - publish: '$(Build.ArtifactStagingDirectory)'
+            displayName: 'Publish timestamp file for later use'
+            artifact: ${{parameters.ARTIFACT_NAME}}
+
+
+Explanation:------------------------------------------------------------------------------
+
+This template is reusable and defines the sequence of steps needed to:
+
+Load the timestamp created in SetTimestamp.
+
+Prepare Azure storage containers for input/output data.
+
+Build a Kubernetes job manifest for training.
+
+Connect to the correct AKS cluster.
+
+Deploy the training job to Kubernetes.
+
+Monitor the job progress until completion.
+
+Save logs and timestamps as pipeline artifacts.
+
+That way, Dev and Prod stages only need to provide different parameters (service connections, namespace, storage accounts, artifact names), but the workflow is identical.
+
+📌 Step-by-step explanation
+🔹 Parameters
+parameters:
+  DEPLOYMENT_SERVICE_CONNECTION: 'NOT_DEFINE'
+  NAMESPACE: 'NOT_DEFINE'
+  AZURE_STORAGE_ACCOUNT: 'NOT_DEFINE'
+  AZURE_STORAGE_ACCOUNT_SAS_TOKEN: 'NOT_DEFINE'
+  ARTIFACT_NAME: 'NOT_DEFINE'
+  AZURE_MODEL2_OUTPUT_CONTAINER: 'NOT_DEFINE'
+  AZURE_STORAGE_WORKSPACE_CONTAINER: 'NOT_DEFINE'
+
+
+Inputs passed from the calling pipeline (DevTrain or ProdTrain).
+
+These control:
+
+Which AKS cluster to deploy to (DEPLOYMENT_SERVICE_CONNECTION, NAMESPACE).
+
+Which storage account + SAS token to use.
+
+Where artifacts/logs go (ARTIFACT_NAME).
+
+==========================================================================================================================
+
+🔹 Step 1: Get training timestamp
+- download: current
+  artifact: scratchpad
+
+- bash: |
+    TRAIN_TIMESTAMP=$(<'$(Pipeline.Workspace)/scratchpad/TrainTimestamp.txt') 
+    echo "##vso[task.setvariable variable=TrainTimestamp;]${TRAIN_TIMESTAMP}"
+
+
+Downloads the TrainTimestamp.txt artifact created in the SetTimestamp stage.
+
+Exposes it as pipeline variable $(TrainTimestamp) so it can be reused.
+==========================================================================================================================
+
+🔹 Step 2: Update/install dependencies
+- template: updateInstalls.yml
+
+
+Runs a shared template (not shown here) to prepare environment/tools.
+==========================================================================================================================
+
+🔹 Step 3: Get storage account
+- task: AzureCLI@2
+  displayName: Get storage account name
+
+
+Lists available storage accounts.
+
+If one wasn’t passed in (NOT_DEFINE), it picks the first storage account from the service connection.
+
+Sets pipeline variable $(AzureStorageAccount).
+==========================================================================================================================
+
+🔹 Step 4: Ensure storage containers exist
+- powershell: |
+    $AZURE_STORAGE_OUTPUT_CONTAINER='${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+    $AZURE_STORAGE_WORKSPACE_CONTAINER='${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+   
+
+
+Validates that the output + workspace containers exist in the blob storage.
+
+If missing, creates them using the SAS token.
+
+$AZURE_STORAGE_OUTPUT_CONTAINER='${{parameters.AZURE_MODEL2_OUTPUT_CONTAINER}}' 
+$AZURE_STORAGE_WORKSPACE_CONTAINER='${{parameters.AZURE_STORAGE_WORKSPACE_CONTAINER}}'
+Reads pipeline parameters into PowerShell variables.
+
+These are the container names where:
+
+OUTPUT_CONTAINER → model outputs (trained model artifacts).
+
+WORKSPACE_CONTAINER → intermediate/workspace files.
+
+==========================================================================================================================
+
+
+write-output 'storage account is $(AzureStorageAccount)'
+write-output "AZURE_STORAGE_OUTPUT_CONTAINER=$AZURE_STORAGE_OUTPUT_CONTAINER"
+write-output "AZURE_STORAGE_WORKSPACE_CONTAINER=$AZURE_STORAGE_WORKSPACE_CONTAINER "
+
+Prints values (useful for debugging if something is misconfigured).
+
+==========================================================================================================================
+
+
+$context = New-AzStorageContext -StorageAccountName '$(AzureStorageAccount)' -SasToken '${{parameters.AZURE_STORAGE_ACCOUNT_SAS_TOKEN}}'
+$contents = Get-AZStorageContainer -context $context
+
+Creates a storage context for Azure Blob using account name + SAS token.
+
+Lists all containers in that account ($contents).
+
+==========================================================================================================================
+
+
+if (-not ( $contents | where name -eq $AZURE_STORAGE_OUTPUT_CONTAINER)) {
+   New-AzStorageContainer -context $context -name $AZURE_STORAGE_OUTPUT_CONTAINER  -Permission Container
+}
+if (-not ( $contents | where name -eq $AZURE_STORAGE_WORKSPACE_CONTAINER)) {
+   New-AzStorageContainer -context $context -name $AZURE_STORAGE_WORKSPACE_CONTAINER -Permission Container
+}
+Ensures both required containers exist.
+
+If not, creates them with Container-level access.
+(This makes blobs accessible with a SAS token.)
+
+==========================================================================================================================
+
+
+(gc 'deployment/kubernetes/$(jobManifest)')
+   .replace('{TRAIN_TIMESTAMP}','$(TrainTimestamp)')
+   .replace('$(TrainImageName):latest','$(TrainImageName):$(resources.pipeline.sourcetrainbuild.runName)') `
+   > $(Build.ArtifactStagingDirectory)/$(jobManifest)
+
+Reads the Kubernetes job manifest template ($(jobManifest) is passed in from parameters).
+
+Performs string replacements:
+
+{TRAIN_TIMESTAMP} → actual timestamp of training run.
+
+$(TrainImageName):latest → replaces :latest with the actual build run tag ($(resources.pipeline.sourcetrainbuild.runName)).
+
+Writes updated manifest into the artifact staging directory, ready for deployment.
+
+==========================================================================================================================
+
+
+
+
+🔹 Step 5: Prepare Kubernetes manifest
+(gc 'deployment/kubernetes/$(jobManifest)').replace('{TRAIN_TIMESTAMP}','$(TrainTimestamp)')...
+
+
+Reads a Kubernetes job manifest file (from repo).
+
+Replaces placeholders with:
+
+The actual TrainTimestamp.
+
+The actual container image tag ($(TrainImageName):$(resources.pipeline.sourcetrainbuild.runName)).
+
+Saves the customized manifest into $(Build.ArtifactStagingDirectory).
+
+==========================================================================================================================
+
+
+🔹 Step 6: Get AKS cluster info
+- task: AzureCLI@2
+  displayName: Get aks cluster name
+
+
+Looks up AKS clusters the service connection has access to.
+
+If aksName and aksResourceGroup are not already set, picks the first one available.
+
+Saves them as pipeline variables.
+
+==========================================================================================================================
+
+🔹 Step 7: Connect to AKS
+- task: AzureCLI@2
+  displayName: use kubelogin to connect
+
+
+Uses az aks get-credentials + kubelogin to authenticate to the AKS cluster.
+
+Switches to the namespace provided in the parameters.
+
+Verifies by listing pods.
+
+==========================================================================================================================
+
+
+🔹 Step 8: Apply manifest
+- task: AzureCLI@2
+  displayName: apply manifest
+
+
+Creates Kubernetes secrets/configmaps with:
+
+SAS token.
+
+Storage account name.
+
+Container names.
+
+Applies the Kubernetes job manifest (training job).
+
+==========================================================================================================================
+
+
+🔹 Step 9: Monitor job progress
+- task: AzureCLI@2
+  displayName: 'Check job progress'
+
+
+Polls Kubernetes to:
+
+Track pods created by the job.
+
+Stream logs.
+
+Detect completion/failure.
+
+Writes job logs to pipeline artifacts.
+
+Fails the pipeline if the Kubernetes job fails.
+
+==========================================================================================================================
+
+
+🔹 Step 10: Record final timestamp
+- bash: |
+    echo "$(TrainTimestamp)" > TrainTimestamp.txt
+    echo "Branch is $(resources.pipeline.sourcetrainbuild.sourceBranch)"
+
+
+Saves timestamp + branch for later stages to consume.
+
+🔹 Step 11: Publish artifacts
+- publish: '$(Build.ArtifactStagingDirectory)'
+  artifact: ${{parameters.ARTIFACT_NAME}}
+
+
+Publishes the final timestamp + logs under artifact name (e.g. devresults or prodresults).
+
+This allows later pipelines/stages to retrieve the correct training run data.
+
+✅ Summary
+
+This template encapsulates the actual ML training deployment flow:
+
+Load timestamp from earlier stage.
+
+Validate/create Azure storage containers.
+
+Generate job manifest with timestamp + build version.
+
+Connect to AKS cluster and namespace.
+
+Deploy Kubernetes training job.
+
+Monitor logs and job completion.
+
+Save outputs + logs as pipeline artifacts.
+
+👉 Essentially:
+
+DevTrain calls this with Dev AKS + Dev Storage + devresults.
+
+ProdTrain calls this with Prod AKS + Prod Storage + prodresults.
+
+The template itself doesn’t care if it’s Dev or Prod — the parameters make it reusable.
+
+========================================================================================================================================================
+========================================================================================================================================================
+========================================================================================================================================================
+
+# model-training-job.yaml
+
+apiVersion: batch/v1
+kind: Job
+# kind: CronJob
+metadata:
+        name: model-training-sequenced-job-{TRAIN_TIMESTAMP}
+spec:
+#       uncomment if cronjob
+#        schedule: "*/1 * * * *"
+#        concurrencyPolicy: Forbid 
+
+        ttlSecondsAfterFinished: 3600  # logs are in devops - no reason to keep the job after completion
+        template:
+          metadata:
+            name: model-training-sequenced-job-{TRAIN_TIMESTAMP}
+          spec:
+      # would be nice to have - but tidyverse will need a sudoers file drawn up to use this
+      #      securityContext:
+      #        runAsUser: 1001
+      #        fsGroup: 1001 
+      # these tolerations and node selector will force job to run on gpu-capable pool
+            tolerations:
+            - key: sku
+              operator: Equal
+              value: gpu
+              effect: NoSchedule
+            nodeSelector:
+              agentpool: gpunp
+            initContainers:
+            - name: revenue-prediction-m1-m2-train
+              image: rtirevenueprediction.azurecr.io/revenue-prediction-m1-m2-train:latest
+              # memory request forces job/pod to the larger node pool
+              command: ["/bin/sh"]
+              args: ["-c", "env | grep -i -v key; echo '{TRAIN_TIMESTAMP}' > ./TrainTimestamp.txt;Rscript --verbose train.r"]
+              imagePullPolicy: IfNotPresent
+              resources:
+                requests:
+                  memory: "8000Mi"
+              env:
+              # moving this to the config map will prevent parallel runs. so leave it here even though it's common
+              - name: TRAIN_TIMESTAMP
+                value: "{TRAIN_TIMESTAMP}"
+              - name: AZURE_STORAGE_OUTPUT_CONTAINER
+                valueFrom:
+                  configMapKeyRef:
+                    name: model-training-config
+                    key: AZURE_MODEL2_OUTPUT_CONTAINER
+              envFrom:
+              # kubernetes secret loaded from build pipeline
+              - secretRef:
+                  name: model-training-secret
+              - configMapRef:
+                  name: model-training-config
+            containers:
+            - name: job-done
+              image: busybox
+              command: ['sh', '-c', 'echo "training completed"']
+            dnsPolicy: ClusterFirst
+            restartPolicy: Never
+
+# Explanataion:=--------------------------------------------------------------------------------
+
+# apiVersion: batch/v1
+
+
+# This Job uses Kubernetes’ batch API (for jobs and cronjobs).
+
+# kind: Job
+# # kind: CronJob
+
+
+# Defines a Job (one-time workload).
+# If you uncomment kind: CronJob, you could schedule it to run periodically instead.
+
+# metadata:
+#         name: model-training-sequenced-job-{TRAIN_TIMESTAMP}
+
+
+# Job name. The {TRAIN_TIMESTAMP} placeholder is replaced at runtime (e.g., 20250825) so each run has a unique identifier.
+
+# spec:
+# #       uncomment if cronjob
+# #        schedule: "*/1 * * * *"
+# #        concurrencyPolicy: Forbid 
+
+
+# Start of Job specification.
+# If it were a CronJob:
+
+# schedule: "*/1 * * * *" → run every minute
+
+# concurrencyPolicy: Forbid → prevent overlapping runs
+
+#         ttlSecondsAfterFinished: 3600  # logs are in devops - no reason to keep the job after completion
+
+
+# Once the Job finishes, Kubernetes deletes the Job object after 3600 seconds (1 hour). Logs remain in DevOps (so we don’t need the object lingering).
+
+#         template:
+#           metadata:
+#             name: model-training-sequenced-job-{TRAIN_TIMESTAMP}
+
+
+# Defines the Pod template for this Job. Pods will inherit this name pattern.
+
+#           spec:
+#       # would be nice to have - but tidyverse will need a sudoers file drawn up to use this
+#       #      securityContext:
+#       #        runAsUser: 1001
+#       #        fsGroup: 1001 
+
+
+# Beginning of Pod spec.
+# Security context (commented) shows intent to run as non-root user/group (for better security), but left disabled since tidyverse R package requires elevated permissions.
+
+#       # these tolerations and node selector will force job to run on gpu-capable pool
+#             tolerations:
+#             - key: sku
+#               operator: Equal
+#               value: gpu
+#               effect: NoSchedule
+#             nodeSelector:
+#               agentpool: gpunp
+
+
+# tolerations: allows this Pod to run on nodes tainted for GPU workloads (taint sku=gpu:NoSchedule)
+
+# nodeSelector: forces scheduling on nodes in agent pool gpunp (GPU-enabled pool).
+
+# This ensures training jobs land on GPU-capable nodes.
+
+#             initContainers:
+
+
+# Start of init containers (run before main containers).
+
+#             - name: revenue-prediction-m1-m2-train
+
+
+# Init container name. It handles training models M1 & M2.
+
+#               image: rtirevenueprediction.azurecr.io/revenue-prediction-m1-m2-train:latest
+
+
+# Uses the M1-M2 training image from Azure Container Registry, tag latest.
+
+#               # memory request forces job/pod to the larger node pool
+#               command: ["/bin/sh"]
+#               args: ["-c", "env | grep -i -v key; echo '{TRAIN_TIMESTAMP}' > ./TrainTimestamp.txt;Rscript --verbose train.r"]
+
+
+# Runs /bin/sh -c "..."
+
+# Prints environment variables (but hides secrets containing key)
+
+# Writes the TRAIN_TIMESTAMP to a file TrainTimestamp.txt
+
+# Runs the R script train.r (actual training logic)
+
+#               imagePullPolicy: IfNotPresent
+
+
+# Only pull the image if not cached locally.
+
+#               resources:
+#                 requests:
+#                   memory: "8000Mi"
+
+
+# Requests 8 GiB RAM so it schedules on a large node (GPU nodes have more RAM).
+
+#               env:
+#               # moving this to the config map will prevent parallel runs. so leave it here even though it's common
+#               - name: TRAIN_TIMESTAMP
+#                 value: "{TRAIN_TIMESTAMP}"
+
+
+# Environment variable TRAIN_TIMESTAMP (passed in from pipeline templating).
+# Kept inline instead of ConfigMap to allow parallel jobs.
+
+#               - name: AZURE_STORAGE_OUTPUT_CONTAINER
+#                 valueFrom:
+#                   configMapKeyRef:
+#                     name: model-training-config
+#                     key: AZURE_MODEL2_OUTPUT_CONTAINER
+
+
+# Pulls AZURE_STORAGE_OUTPUT_CONTAINER value from the ConfigMap model-training-config, key AZURE_MODEL2_OUTPUT_CONTAINER.
+
+#               envFrom:
+#               # kubernetes secret loaded from build pipeline
+#               - secretRef:
+#                   name: model-training-secret
+#               - configMapRef:
+#                   name: model-training-config
+
+
+# Loads environment variables from:
+
+# Secret: model-training-secret → sensitive stuff (keys, passwords, connection strings)
+
+# ConfigMap: model-training-config → non-sensitive configs
+
+#             containers:
+
+
+# Now define the main containers (run after init containers).
+
+#             - name: job-done
+#               image: busybox
+#               command: ['sh', '-c', 'echo "training completed"']
+
+
+# A dummy container that only prints "training completed" and exits.
+# The real training work happens in the init container above.
+# This exists just to mark the Job as successful when init completes.
+
+#             dnsPolicy: ClusterFirst
+
+
+# Use cluster DNS for Pod networking.
+
+#             restartPolicy: Never
+
+
+# Do not restart containers if they fail.
+# 👉 If the Job fails, the Job controller may retry by creating a new Pod (depending on backoffLimit, not set here, so default is 6 retries).
+
+# ✅ Summary:
+# This Job runs M1-M2 model training on GPU-capable nodes.
+
+# Init container does all training work (runs R script, uses Azure storage).
+
+# It injects secrets/configs for storage and environment.
+
+# When training finishes, a dummy container prints success.
+
+# Job auto-deletes after 1 hour.           
+
+
+=============================================================================================================================================
+
+apiVersion: batch/v1                 # Use the Kubernetes Batch API (Jobs/CronJobs live here)
+kind: Job                            # This manifest creates a one-off Job (not a Deployment)
+
+# kind: CronJob                      # (commented) Alternative: make it a repeating CronJob
+
+metadata:
+  name: model-training-sequenced-job-{TRAIN_TIMESTAMP}
+                                     # Job name. The pipeline replaces {TRAIN_TIMESTAMP}
+                                     # with a unique value so each run has a unique name.
+
+spec:
+  # uncomment if cronjob
+  # schedule: "*/1 * * * *"          # (CronJob only) cron schedule — every minute, as example
+  # concurrencyPolicy: Forbid         # (CronJob only) don’t start a new run if previous still running
+
+  ttlSecondsAfterFinished: 3600       # Auto-garbage-collect Job (and its Pods) 1 hour after finish.
+                                      # Keeps the cluster tidy; logs live in DevOps artifacts anyway.
+
+  template:                           # Pod template: what the Job will run
+    metadata:
+      name: model-training-sequenced-job-{TRAIN_TIMESTAMP}
+                                      # Pod name template (also gets timestamp injected)
+
+    spec:
+      # would be nice to have - but tidyverse will need a sudoers file drawn up to use this
+      # securityContext:
+      #   runAsUser: 1001
+      #   fsGroup: 1001               # (commented) Example of running as non-root/user group
+
+      # these tolerations and node selector will force job to run on gpu-capable pool
+      tolerations:
+      - key: sku
+        operator: Equal
+        value: gpu
+        effect: NoSchedule            # Tolerate a "sku=gpu:NoSchedule" taint so Pod can land on GPU nodes
+
+      nodeSelector:
+        agentpool: gpunp              # Also *select* nodes labeled in the "gpunp" agent pool (GPU pool)
+
+      initContainers:                 # Containers that must complete *before* main containers start
+      - name: revenue-prediction-m1-m2-train
+        image: rtirevenueprediction.azurecr.io/revenue-prediction-m1-m2-train:latest
+                                      # Training image. In your pipeline, ":latest" is replaced with the
+                                      # CI tag so you run the exact built image for that run.
+
+        # memory request forces job/pod to the larger node pool
+        command: ["/bin/sh"]          # Entrypoint for the init container
+        args: ["-c",
+               "env | grep -i -v key; \
+                echo '{TRAIN_TIMESTAMP}' > ./TrainTimestamp.txt; \
+                Rscript --verbose train.r"]
+                                      # Shell script:
+                                      # 1) print env (excluding *key* lines) for debugging
+                                      # 2) write the TRAIN_TIMESTAMP to a file inside the container
+                                      # 3) run your R training script verbosely
+
+        imagePullPolicy: IfNotPresent # Pull image only if not cached on the node
+
+        resources:
+          requests:
+            memory: "8000Mi"          # Ask for 8GiB so scheduler picks a suitably large node/pool
+
+        env:                          # Explicit env vars for this container
+        # moving this to the config map will prevent parallel runs. so leave it here even though it's common
+        - name: TRAIN_TIMESTAMP
+          value: "{TRAIN_TIMESTAMP}"  # The timestamp literal (replaced by pipeline before apply)
+
+        - name: AZURE_STORAGE_OUTPUT_CONTAINER
+          valueFrom:
+            configMapKeyRef:
+              name: model-training-config
+              key: AZURE_MODEL2_OUTPUT_CONTAINER
+                                      # Read the output container name from a ConfigMap key
+
+        envFrom:
+        # kubernetes secret loaded from build pipeline
+        - secretRef:
+            name: model-training-secret
+                                      # Load all keys from Secret as env vars (e.g., SAS token, etc.)
+
+        - configMapRef:
+            name: model-training-config
+                                      # Load remaining non-secret settings from ConfigMap as env vars
+
+      containers:                     # Main workload containers (Job completion depends on these)
+      - name: job-done
+        image: busybox
+        command: ['sh', '-c', 'echo "training completed"']
+                                      # A tiny container that just echoes and exits 0.
+                                      # Because training ran in the *init* container, a successful init +
+                                      # this container exiting means the Job is considered complete.
+
+      dnsPolicy: ClusterFirst         # Default cluster DNS resolution policy
+      restartPolicy: Never            # If the container exits, don’t restart the Pod.
+                                      # (The Job controller, not the Pod, handles retries/backoff.)
+                                      
+                                      
+Notes & gotchas (useful context)
+Init container does the training: That’s intentional here. If the training fails, the init container fails and the main container never starts, so the Job won’t reach “Succeeded”. Your pipeline step that monitors the Job will see this and fail appropriately.
+
+GPU nodes: You’re scheduling onto GPU-tainted nodes via tolerations + nodeSelector. If you intend to actually use GPU, you typically also request them, e.g.:
+
+yaml
+Copy code
+resources:
+  limits:
+    nvidia.com/gpu: 1
+(Otherwise you’re just landing on GPU nodes without reserving a GPU device.)
+
+Image tag replacement: Your pipeline replaces :latest with a CI build tag so each run uses a pinned image. Make sure the string you replace matches the manifest. If your pipeline replaces $(TrainImageName):latest but the manifest uses a full registry path, ensure $(TrainImageName) includes the registry path or adjust the replacement target accordingly.
+
+ttlSecondsAfterFinished: Requires the TTL controller (it’s been GA in K8s for a while). It cleans up finished Jobs/Pods 3600s (1h) after completion—keeps the cluster tidy.
+
+Cron option: If you convert to a CronJob, uncomment kind: CronJob, add spec.schedule, and move the Pod template under spec.jobTemplate.spec.template. concurrencyPolicy: Forbid is a good choice to avoid overlapping runs.
+
+==================================================================================================================================================================================================================
+==================================================================================================================================================================================================================
+==================================================================================================================================================================================================================
+
+# updateInstalls.yaml
+
+steps:
+    - task: Bash@3
+      displayName: install zip
+      inputs:
+        targetType: 'inline'
+        script: |
+          which zip
+          if [ ! -f /usr/bin/zip ]
+          then
+             sudo apt-get -y install zip
+          fi
+    - task: HelmInstaller@0
+      displayName: Install Kubernetes/Helm
+      inputs:
+        helmVersion: '2.14.1'
+        installKubectl: true
+    - task: Bash@3
+      displayName: Install kubelogin
+      inputs:
+        targetType: 'inline'
+        script: |
+          # get kubelogin
+          if [ ! -f /usr/bin/kubelogin ]
+          then
+            wget https://github.com/Azure/kubelogin/releases/download/v0.0.9/kubelogin-linux-amd64.zip
+            unzip kubelogin-linux-amd64.zip
+            sudo mv bin/linux_amd64/kubelogin /usr/bin
+          fi 
+    - task: AzureCLI@2
+      name: "Install_azure_modules"
+      inputs:
+        azureSubscription: 'cfo-apps-revpred-deploy-dev-AKSLOWDEVPRV001'    # dont really care what subscription, any valid will do
+        scriptType: 'pscore'
+        scriptLocation: 'inlineScript'
+        failOnStandardError: false
+        powerShellErrorActionPreference: 'continue'
+        inlineScript: |
+
+          if (-not (Get-Module -list 'az.accounts')) {
+            Install-Module az.accounts -Scope CurrentUser -Force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'az.resources'))  {
+            Install-Module az.resources -scope currentuser -force -SkipPublisherCheck 
+            }
+          if (-not (Get-Module -list 'az.storage'))  {
+            Install-Module az.storage -scope currentuser -force -SkipPublisherCheck 
+            }
+
+
+Explanataion:-----------------------------------------------------------------------------------------------------------------------------------
+
+Step 1: Ensure zip is installed
+- task: Bash@3
+  displayName: install zip
+  script: |
+    which zip
+    if [ ! -f /usr/bin/zip ]
+    then
+       sudo apt-get -y install zip
+    fi
+
+
+Checks if zip is already installed (/usr/bin/zip).
+
+If not, installs it using apt-get.
+
+Needed because later stages unzip packages (like kubelogin) and sometimes publish zipped artifacts.
+
+🔹 Step 2: Install Helm (and kubectl)
+- task: HelmInstaller@0
+  displayName: Install Kubernetes/Helm
+  inputs:
+    helmVersion: '2.14.1'
+    installKubectl: true
+
+
+Installs Helm v2.14.1 (a package manager for Kubernetes).
+
+Also installs kubectl (the CLI to interact with Kubernetes clusters).
+
+Both are required to interact with AKS and deploy manifests.
+
+🔹 Step 3: Install kubelogin
+- task: Bash@3
+  displayName: Install kubelogin
+  script: |
+    if [ ! -f /usr/bin/kubelogin ]
+    then
+      wget https://github.com/Azure/kubelogin/releases/download/v0.0.9/kubelogin-linux-amd64.zip
+      unzip kubelogin-linux-amd64.zip
+      sudo mv bin/linux_amd64/kubelogin /usr/bin
+    fi 
+
+
+Ensures kubelogin is available.
+
+kubelogin integrates Azure AD authentication into kubectl (critical for accessing AKS clusters with Azure-managed identity/service principal).
+
+If not present, downloads release v0.0.9, unzips, and installs into /usr/bin.
+
+🔹 Step 4: Install required Azure PowerShell modules
+- task: AzureCLI@2
+  name: "Install_azure_modules"
+  inputs:
+    azureSubscription: 'cfo-apps-revpred-deploy-dev-AKSLOWDEVPRV001'
+    scriptType: 'pscore'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      if (-not (Get-Module -list 'az.accounts')) {
+        Install-Module az.accounts -Scope CurrentUser -Force -SkipPublisherCheck 
+      }
+      if (-not (Get-Module -list 'az.resources'))  {
+        Install-Module az.resources -scope currentuser -force -SkipPublisherCheck 
+      }
+      if (-not (Get-Module -list 'az.storage'))  {
+        Install-Module az.storage -scope currentuser -force -SkipPublisherCheck 
+      }
+
+
+Runs inside an AzureCLI@2 task, authenticated with a valid Azure subscription (any subscription works, since the task is just to install modules).
+
+Installs required Azure PowerShell modules (az.accounts, az.resources, az.storage).
+
+These are used in later steps of deployTrainJobManifest.yml (for storage account, container creation, secrets, etc.).
+
+✅ Why this template exists
+
+Keeps the main pipeline clean by separating setup/bootstrapping into a shared file.
+
+Guarantees all later steps (kubectl, helm, kubelogin, Azure storage commands) won’t fail due to missing tools.
+
+Makes the pipeline reusable across Dev/Prod — because no matter the agent, this template ensures the right environment is in place.
+
+👉 So in the bigger picture:
+
+SetTimestamp = generates a unique ID for the training run.
+
+updateInstalls.yml = prepares the environment.
+
+deployTrainJobManifest.yml = actually deploys and monitors the training job on AKS.
+
+
+
+
+ 
+
